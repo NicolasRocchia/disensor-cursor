@@ -1,0 +1,24 @@
+{
+  "note": "Prefix of the model slug Cursor reports, mapped to the model family disensor declares. Cursor does not publish stable slugs: its models page lists display names, so this table is maintained by hand and is deliberately incomplete. A slug that matches nothing here stays UNMAPPED, and unmapped means nothing is prefilled. Inventing a family would make R4 validate a decorrelation that never happened.",
+  "families": ["anthropic", "openai", "google", "meta", "mistral", "other"],
+  "prefixes": {
+    "claude": "anthropic",
+    "gpt": "openai",
+    "o1": "openai",
+    "o3": "openai",
+    "o4": "openai",
+    "gemini": "google",
+    "llama": "meta",
+    "mistral": "mistral",
+    "codestral": "mistral",
+    "devstral": "mistral"
+  },
+  "deliberately_unmapped": {
+    "auto": "Cursor picks the model. The slug does not say which one ran, so the generator cannot be declared.",
+    "composer": "Cursor's own models. They would collapse into 'other', where R4 cannot tell them apart from any other unmapped vendor.",
+    "grok": "xAI has no family of its own in the schema enum. See the residue note in the README.",
+    "kimi": "Moonshot has no family of its own in the schema enum.",
+    "glm": "Z.ai has no family of its own in the schema enum.",
+    "muse": "No family of its own in the schema enum."
+  }
+}
