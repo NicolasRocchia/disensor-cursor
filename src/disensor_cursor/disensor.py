@@ -10,11 +10,13 @@ with, and can say so when it does not.
 """
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import NamedTuple
 
-from . import gitio
+from . import clock, gitio
 
 # Los codigos que publica `disensor round`, estables dentro de una serie mayor.
 OK = 0
@@ -31,6 +33,37 @@ BLOCKED = "blocked"
 UNAVAILABLE = "unavailable"
 
 DEFAULT_TIMEOUT = 8.0
+
+GATES = ("plan", "diff", "architecture")
+
+
+class Check(NamedTuple):
+    verdict: str
+    detail: str
+    # Las compuertas que la politica acepta para el rango, cuando se pudieron
+    # leer. None no significa "ninguna": significa "no se sabe".
+    gates: tuple[str, ...] | None = None
+
+
+_GATES_LINE = re.compile(r"\bgates\s+([a-z][a-z, ]*)$")
+
+
+def parse_gates(detail: str) -> tuple[str, ...] | None:
+    """The accepted gates from `round --check`'s last line, or None.
+
+    That line is prose, and prose is not part of the surface disensor promises
+    as stable: only exit codes, documented flags and configuration keys are.
+    So this reads it tolerantly, returns None when it cannot, and the contract
+    tests pin today's wording so a change shows up as a failing test instead of
+    as a silently wrong command.
+    """
+    match = _GATES_LINE.search((detail or "").strip())
+    if not match:
+        return None
+    found = tuple(g.strip() for g in match.group(1).split(",") if g.strip())
+    if not found or any(g not in GATES for g in found):
+        return None
+    return found
 
 
 def locate(hint: str | None = None, repo: Path | None = None) -> Path | None:
@@ -59,14 +92,22 @@ def locate(hint: str | None = None, repo: Path | None = None) -> Path | None:
     return resolved
 
 
+MIN_CALL = 0.5
+
+
 def _run(executable: Path, args: list[str], cwd: Path, timeout: float) -> tuple[int, str, str]:
+    # Del presupuesto de la corrida: disensor arranca un Python y hace sus
+    # propias llamadas a git, asi que por debajo de medio segundo no llega.
+    budget = clock.left(timeout)
+    if budget < MIN_CALL:
+        return -1, "", "no time left to ask disensor"
     try:
         done = subprocess.run(
             [str(executable), *args],
-            cwd=str(cwd), capture_output=True, timeout=timeout, check=False,
+            cwd=str(cwd), capture_output=True, timeout=budget, check=False,
         )
     except subprocess.TimeoutExpired:
-        return -1, "", f"disensor did not answer within {timeout}s"
+        return -1, "", f"disensor did not answer within {budget:.1f}s"
     except OSError as exc:
         return -1, "", f"disensor could not run: {exc}"
     # Bytes y no `text=True`: en Windows el decodificado usa la pagina local y
@@ -85,11 +126,11 @@ def check_requirement(
     base: str,
     head: str,
     *,
-    directory: str = ".residue",
-    config: str = "disensor.config.json",
+    directory: str | None = None,
+    config: str | None = None,
     timeout: float = DEFAULT_TIMEOUT,
-) -> tuple[str, str]:
-    """Ask disensor whether this range demands a round. Returns (verdict, detail).
+) -> Check:
+    """Ask disensor whether this range demands a round.
 
     `--check` returns before the runner touches the tree, the registry or the
     network, so this is safe to call on a dirty tree and costs only git.
@@ -99,30 +140,35 @@ def check_requirement(
     it. A placeholder keeps the invocation valid without asserting anything
     about who generated the code, which is what the prefill is for and what
     this call must not decide.
+
+    `--directory` and `--config` go only when the user configured them. disensor
+    promises the flags its README documents, and neither is documented for
+    `round`: without them the call rests on `--check` and promised flags only,
+    and disensor applies its own defaults, the same ones its gate applies.
+    `--check` itself is not documented either, which is what the contract tests
+    exist for.
     """
-    code, _, err = _run(
-        executable,
-        [
-            "round", "--gate", "diff",
-            "--generator-family", "other",
-            "--base", base, "--head", head,
-            "--directory", directory, "--config", config,
-            "--check",
-        ],
-        repo,
-        timeout,
-    )
+    args = [
+        "round", "--gate", "diff",
+        "--generator-family", "other",
+        "--base", base, "--head", head,
+    ]
+    if directory:
+        args += ["--directory", directory]
+    if config:
+        args += ["--config", config]
+    code, _, err = _run(executable, [*args, "--check"], repo, timeout)
     detail = err.strip().splitlines()[-1] if err.strip() else ""
     if code == OK:
-        return REQUIRED, detail
+        return Check(REQUIRED, detail, parse_gates(detail))
     if code == NOT_REQUIRED:
-        return NOT_NEEDED, detail
+        return Check(NOT_NEEDED, detail)
     if code == UNDECIDABLE:
-        return BLOCKED, detail
+        return Check(BLOCKED, detail)
     # Cualquier otra cosa, incluido un disensor viejo que no entiende un flag y
     # sale con el 2 de argparse, es "no pude preguntar". Nunca se convierte en
     # un aviso, y nunca en un silencio sin registro.
-    return UNAVAILABLE, detail or f"disensor exited {code}"
+    return Check(UNAVAILABLE, detail or f"disensor exited {code}")
 
 
 def probe(executable: Path, timeout: float = DEFAULT_TIMEOUT) -> tuple[bool, str]:

@@ -12,7 +12,12 @@ generator is not prefilled and the agent declares it.
 from __future__ import annotations
 
 import json
+import re
 from importlib import resources
+
+# Un slug que no tiene esta forma no se prellena: viaja dentro de un comando
+# que el agente puede copiar y correr, y un `;` ahi dentro seria otro comando.
+SAFE_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}")
 
 
 def _table() -> dict:
@@ -60,7 +65,9 @@ def generator_flags(model: str | None, model_id: str | None) -> list[str]:
     the round declare an independence that did not happen.
     """
     slug = model_id or model
-    family = family_of(slug)
-    if not family or not slug:
+    if not isinstance(slug, str) or not SAFE_SLUG.fullmatch(slug):
         return []
-    return ["--generator-family", family, "--generator-model", str(slug)]
+    family = family_of(slug)
+    if not family:
+        return []
+    return ["--generator-family", family, "--generator-model", slug]
