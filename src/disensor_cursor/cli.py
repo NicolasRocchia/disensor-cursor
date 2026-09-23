@@ -19,12 +19,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 from . import __version__, disensor, executables, gitio, state, templates
 
 USER_HOOKS = Path.home() / ".cursor" / "hooks.json"
+
+_GENERATED_BY = re.compile(r"--generated-by\s+(\S+)")
 
 
 def _resolve_python() -> str:
@@ -89,22 +95,51 @@ def _resolve_disensor() -> tuple[str, str]:
 
 
 def _write_json(path: Path, data: dict) -> None:
+    """Atomic, and patient with Cursor: it may be reading hooks.json right now."""
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_symlink():
         raise OSError(f"{path} is a symlink: refusing to write through it")
-    temporary = path.with_suffix(".json.tmp")
+    temporary = state.unique_temporary(path)
     temporary.write_bytes((json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
-    os.replace(temporary, path)
+    state.replace_file(temporary, path)
 
 
 def _read_json(path: Path) -> dict:
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_bytes().decode("utf-8-sig"))
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _ours(entry) -> bool:
+    return templates.is_ours(entry)
+
+
+def _our_entries(data: dict) -> dict[str, list[dict]]:
+    return {
+        event: [e for e in entries if _ours(e)]
+        for event, entries in (data.get("hooks") or {}).items()
+        if isinstance(entries, list) and any(_ours(e) for e in entries)
+    }
+
+
+_VERSION_MARK = re.compile(r"^<!-- disensor-cursor v[^>]*-->\s*$", re.MULTILINE)
+
+
+def _rule_is_ours(text: str) -> bool:
+    """Whether a rule file is exactly what some version of init wrote.
+
+    The version marker is ignored so an upgrade can recognise what an older
+    version wrote. Anything else that differs is an edit, and an edit is left
+    alone: same doctrine as disensor's own init, which never overwrites a
+    block it cannot recognise as its own.
+    """
+    def normal(s: str) -> str:
+        return _VERSION_MARK.sub("", s.replace("\r\n", "\n")).strip()
+    return normal(text) == normal(templates.RULE)
 
 
 def main_init(args) -> int:
@@ -136,16 +171,27 @@ def main_init(args) -> int:
         # destino se resuelve por repositorio en cada corrida y no se fija aca.
         repo, base = None, None
 
-    generated = templates.hooks_config(python, disensor_path, base)
-    merged = templates.merge_hooks(_read_json(target), generated)
+    try:
+        generated = templates.hooks_config(python, disensor_path, base)
+        merged = templates.merge_hooks(_read_json(target), generated)
+    except ValueError as exc:
+        print(f"init: {exc}")
+        return 1
     _write_json(target, merged)
     report.append(f"wrote {target}")
 
     if args.project and repo is not None:
         rule = repo / ".cursor" / "rules" / "disensor.mdc"
-        rule.parent.mkdir(parents=True, exist_ok=True)
-        rule.write_text(templates.RULE, encoding="utf-8")
-        report.append(f"wrote {rule.relative_to(repo)}")
+        label = rule.relative_to(repo).as_posix()
+        if rule.exists() and not _rule_is_ours(rule.read_bytes().decode("utf-8", "replace")):
+            report.append(f"kept    {label} (edited: left as it is)")
+        else:
+            rule.parent.mkdir(parents=True, exist_ok=True)
+            # En bytes: write_text traduce los saltos a CRLF en Windows y el
+            # archivo entra al repositorio de otra persona con otros finales
+            # de linea que los suyos.
+            rule.write_bytes(templates.RULE.encode("utf-8"))
+            report.append(f"wrote {label}")
         report.append("")
         report.append(
             "WARNING: .cursor/hooks.json is executable code, versioned in this repository, that "
@@ -177,6 +223,165 @@ def main_init(args) -> int:
     return 0
 
 
+def main_uninstall(args) -> int:
+    """Remove exactly what init added, and nothing somebody else wrote."""
+    report: list[str] = []
+    if args.project:
+        repo = gitio.repo_root(Path.cwd())
+        if repo is None:
+            print("uninstall: --project needs to run inside a git repository")
+            return 1
+        target = repo / ".cursor" / "hooks.json"
+    else:
+        repo, target = None, USER_HOOKS
+
+    if target.exists():
+        data = _read_json(target)
+        hooks = data.get("hooks") or {}
+        kept_hooks: dict = {}
+        removed = 0
+        for event, entries in hooks.items():
+            if not isinstance(entries, list):
+                kept_hooks[event] = entries
+                continue
+            kept = [e for e in entries if not _ours(e)]
+            removed += len(entries) - len(kept)
+            if kept:
+                kept_hooks[event] = kept
+        if not removed:
+            report.append(f"nothing of disensor-cursor in {target}")
+        elif not kept_hooks and set(data) <= {"version", "hooks"}:
+            target.unlink()
+            report.append(f"removed {target} (it only held disensor-cursor hooks)")
+        else:
+            data["hooks"] = kept_hooks
+            _write_json(target, data)
+            report.append(f"removed {removed} disensor-cursor entries from {target}; kept the rest")
+    else:
+        report.append(f"no {target}")
+
+    if args.project and repo is not None:
+        rule = repo / ".cursor" / "rules" / "disensor.mdc"
+        label = rule.relative_to(repo).as_posix()
+        if rule.exists():
+            if _rule_is_ours(rule.read_bytes().decode("utf-8", "replace")):
+                rule.unlink()
+                report.append(f"removed {label}")
+            else:
+                report.append(f"kept    {label} (edited: remove it yourself if you want it gone)")
+
+    if args.purge:
+        directory = state.STATE_DIR
+        # is_link y no is_symlink: una junction de Windows no es un symlink
+        # para Python, y rmtree sobre ella fallaba con un traceback.
+        if state.is_link(directory):
+            report.append(f"kept    {directory} (a link or junction: refusing to delete through it)")
+        elif directory.exists():
+            try:
+                shutil.rmtree(directory)
+                report.append(f"removed {directory}")
+            except OSError as exc:
+                report.append(f"could not remove {directory}: {exc}")
+        else:
+            report.append(f"no {directory}")
+
+    for line in report:
+        print(line)
+    return 0
+
+
+def _smoke(command: str, cwd: Path) -> tuple[bool, str]:
+    """Run an installed hook command the way Cursor does, and read the answer.
+
+    Through the shell, because hooks.json holds a command line and not an argv.
+    On Windows that shell is cmd.exe, which is what Node uses for a command
+    line: an assumption about Cursor, but the one that fails loudly if the
+    quoting is wrong. The payload carries a BOM because Cursor sends one, and
+    an unknown conversation, so the hook answers without writing any state.
+    """
+    payload = json.dumps({
+        "conversation_id": f"doctor-{uuid.uuid4().hex}",
+        "hook_event_name": "afterFileEdit",
+        "file_path": str(cwd / "doctor-smoke.txt"),
+    }).encode("utf-8-sig")
+    environment = {**executables.child_environment(), "CURSOR_PROJECT_DIR": str(cwd)}
+    try:
+        done = subprocess.run(
+            command, shell=True, cwd=str(cwd), input=payload,
+            capture_output=True, timeout=20, check=False, env=environment,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "no answer within 20s"
+    except OSError as exc:
+        return False, f"could not run: {exc}"
+    out = (done.stdout or b"").decode("utf-8", "replace").strip()
+    if done.returncode != 0:
+        err = (done.stderr or b"").decode("utf-8", "replace").strip()
+        return False, f"exit {done.returncode}: {(err or out)[:200]}"
+    try:
+        answer = json.loads(out)
+    except json.JSONDecodeError:
+        return False, f"answered something that is not JSON: {out[:120]!r}"
+    if not isinstance(answer, dict):
+        return False, f"answered a {type(answer).__name__}, not an object"
+    return True, "answered, exit 0"
+
+
+def _describe_hooks(label: str, target: Path, cwd: Path, disensor_path: str) -> bool:
+    """Print what is installed in one hooks.json. False when something is off.
+
+    It never executes a command because a file says so. A project hooks.json
+    is written by whoever wrote the repository, and a command that merely
+    contains the marker (`evil & rem disensor_cursor.hook`) would pass for
+    ours: doctor, of all commands the one you run on a repository you do not
+    trust yet, would be the one running it. So the command init would write
+    today is rebuilt, and the installed one is run only if it is that exact
+    string. Anything else is shown, not run.
+    """
+    data = _read_json(target)
+    ours = _our_entries(data)
+    print(f"  hooks ({label}): {target}")
+    if not ours:
+        print("            none installed")
+        return True
+    print(f"            {', '.join(sorted(ours))}")
+    healthy = True
+    versions = {
+        m.group(1)
+        for entries in ours.values() for e in entries
+        for m in [_GENERATED_BY.search(str(e.get("command", "")))] if m
+    }
+    if versions and versions != {__version__}:
+        healthy = False
+        print(
+            f"            generated by {', '.join(sorted(versions))}, running {__version__}: "
+            "re-run `disensor-cursor init` to regenerate them"
+        )
+    probe = (ours.get("afterFileEdit") or [None])[0]
+    if probe:
+        installed = str(probe.get("command", ""))
+        try:
+            # Con los ajustes que el usuario agrego y que init conserva: sin
+            # ellos, un hook configurado como dice el README pasaba por ajeno.
+            expected = templates.command_for(
+                "afterFileEdit", _resolve_python(), disensor_path, None,
+                kept=templates.kept_settings(probe),
+            )
+        except ValueError as exc:
+            print(f"            smoke run: NOT RUN ({exc})")
+            return False
+        if installed != expected:
+            healthy = False
+            print("            smoke run: NOT RUN (the installed command is not the one init writes)")
+            print(f"            installed: {installed}")
+            print(f"            init now:  {expected}")
+        else:
+            ok, detail = _smoke(installed, cwd)
+            print(f"            smoke run: {'ok' if ok else 'FAILED'} ({detail})")
+            healthy = healthy and ok
+    return healthy
+
+
 def main_doctor(args) -> int:
     print(f"disensor-cursor {__version__}")
     print(f"  python:   {_resolve_python()}")
@@ -185,30 +390,46 @@ def main_doctor(args) -> int:
     if problem:
         print(f"            {problem}")
 
-    for label, target in (("user", USER_HOOKS),):
-        data = _read_json(target)
-        events = [
-            event for event, entries in (data.get("hooks") or {}).items()
-            if isinstance(entries, list)
-            and any(templates.MARKER in str(e.get("command", "")) for e in entries if isinstance(e, dict))
-        ]
-        print(f"  hooks ({label}): {target}")
-        print(f"            {', '.join(sorted(events)) if events else 'none installed'}")
+    healthy = True
+    if not state.usable():
+        healthy = False
+        print(f"  state:    {state.STATE_DIR} is a link or junction: the hook writes nothing there")
+        print("            and stays inactive. Make it a real directory to enable it.")
 
-    repo = gitio.repo_root(Path.cwd())
+    cwd = Path.cwd()
+    healthy = _describe_hooks("user", USER_HOOKS, cwd, path) and healthy
+    try:
+        healthy = _describe_repository(cwd, path) and healthy
+    except gitio.GitUnavailable as exc:
+        # Lo mismo que hace el hook: git que no contesta no es un traceback.
+        print(f"  repo:     not checked ({exc})")
+        healthy = False
+    return 0 if (healthy and not problem) else 1
+
+
+def _describe_repository(cwd: Path, disensor_path: str) -> bool:
+    repo = gitio.repo_root(cwd)
     if repo is None:
         print("  repo:     not inside a git repository")
-        return 0
+        return True
     print(f"  repo:     {repo}")
     print(f"  adopted:  {'yes' if (repo / 'disensor.config.json').is_file() else 'no (the hook stays quiet)'}")
     base = gitio.default_base(repo)
     print(f"  base:     {base or 'unresolved (origin/main, origin/master)'}")
-    dirty = gitio.is_dirty(repo)
-    print(f"  tree:     {'unknown' if dirty is None else ('dirty' if dirty else 'clean')}")
+    healthy = True
+    try:
+        dirty = gitio.is_dirty(repo)
+        print(f"  tree:     {'unknown' if dirty is None else ('dirty' if dirty else 'clean')}")
+    except gitio.GitUnavailable as exc:
+        # El hook tampoco lo va a poder mirar, y sin eso no avisa nada en este
+        # repositorio: es exactamente lo que doctor tiene que decir.
+        print(f"  tree:     not checked: {exc}")
+        print("            the hook stays quiet in this repository for the same reason")
+        healthy = False
     project_hooks = repo / ".cursor" / "hooks.json"
     if project_hooks.exists():
-        print(f"  hooks (project): {project_hooks}")
-    return 0 if not problem else 1
+        healthy = _describe_hooks("project", project_hooks, repo, disensor_path) and healthy
+    return healthy
 
 
 def main_status(args) -> int:
@@ -234,7 +455,7 @@ def main_status(args) -> int:
         print(f"  mode:     {data.get('composer_mode', '?')}"
               f"{' (background)' if data.get('is_background_agent') else ''}")
         print(f"  reported: {', '.join(data.get('reported') or []) or 'nothing'}")
-        print(f"  edits:    {len(edits)} file(s) touched")
+        print(f"  edits:    {len(edits)} recorded")
     log = state.log_path()
     if log.exists():
         print(f"\nnot evaluated, and why ({log}):")
@@ -274,7 +495,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.set_defaults(func=main_init)
 
-    doctor = sub.add_parser("doctor", help="What is installed and whether it can work here.")
+    uninstall = sub.add_parser(
+        "uninstall", help="Remove the hooks init added, keeping everything else.",
+    )
+    uninstall.add_argument(
+        "--project", action="store_true", help="Remove them from .cursor/ of this repository.",
+    )
+    uninstall.add_argument(
+        "--purge", action="store_true",
+        help=f"Also delete the session state in {state.STATE_DIR}.",
+    )
+    uninstall.set_defaults(func=main_uninstall)
+
+    doctor = sub.add_parser(
+        "doctor", help="What is installed, whether it runs, and whether it can work here.",
+    )
     doctor.set_defaults(func=main_doctor)
 
     status = sub.add_parser("status", help="What the hook decided, and what it could not.")

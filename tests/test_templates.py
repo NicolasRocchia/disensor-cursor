@@ -18,6 +18,46 @@ ROOT = Path(__file__).resolve().parents[1]
 BASE_PYTHON = getattr(sys, "_base_executable", None) or sys.executable
 
 
+# --- identidad de nuestras entradas ---------------------------------------
+
+@pytest.mark.parametrize("command", [
+    templates.command_for("stop", r"C:\Python314\python.exe", r"C:\bin\disensor.exe", "origin/main"),
+    templates.command_for("afterFileEdit", r"C:\Program Files\Python\python.exe",
+                          r"C:\Program Files\disensor\disensor.exe", None),
+    templates.command_for("stop", r"C:\Python314\python.exe", "", None,
+                          location=r"C:\Users\Nicolás\My Apps\site-packages"),
+    # Lo que escribio la 0.1.0: sin -E ni -P y sin comillas donde no habia espacios.
+    r"C:\Python314\python.exe -m disensor_cursor.hook --event stop --disensor "
+    r"C:\Users\x\disensor.EXE --base origin/main --generated-by 0.1.0",
+    r'"C:\Program Files\Python\python.exe" -m disensor_cursor.hook --event afterFileEdit '
+    r"--generated-by 0.1.0",
+    # Los borradores de 0.2.0, que llegaron a escribirse en maquinas de prueba.
+    r'"C:\Python314\python.exe" -E -P -m disensor_cursor.hook --event stop --generated-by 0.2.0',
+    '"C:\\Python310\\python.exe" -E -c "' + templates._SAFE_ENTRY_310 + '" --event stop '
+    "--generated-by 0.2.0",
+])
+def test_what_init_writes_is_recognised_as_ours(command):
+    assert templates.is_ours({"command": command})
+
+
+@pytest.mark.parametrize("command", [
+    "python audit.py --label disensor_cursor.hook",
+    "otra-herramienta --stop",
+    "evil.exe & rem disensor_cursor.hook --event stop --generated-by 1",
+    # Codex, segunda ronda: con comodines alrededor del import, esto pasaba
+    # por nuestro aunque solo imprime el texto.
+    "\"python\" -c \"print('from disensor_cursor.hook import main')\" --event stop --generated-by 0.2.0",
+    r"C:\Python314\python.exe -m disensor_cursor.hookx --event stop --generated-by 0.2.0",
+    # Codex, quinta ronda: sin mirar el primer token, esto pasaba por nuestro
+    # y init lo borraba, aunque solo imprime.
+    "echo -m disensor_cursor.hook --event stop",
+    r'"C:\Windows\System32\cmd.exe" -m disensor_cursor.hook --event stop',
+    f'"C:\\herramientas\\otra.exe" -I -c "{templates.PROGRAM}" "x" --event stop',
+])
+def test_an_entry_that_only_mentions_the_module_is_somebody_elses(command):
+    assert not templates.is_ours({"command": command})
+
+
 @pytest.mark.parametrize("path, expected", [
     (r"C:\Python314\python.exe", True),
     (r"C:\Users\x\AppData\Local\Programs\Python\Python312\python.exe", True),
@@ -39,6 +79,79 @@ def test_init_refuses_to_write_anything_but_an_interpreter_first():
         templates.command_for("stop", r"C:\herramientas\otra.exe", "", None)
 
 
+@pytest.mark.parametrize("command", [
+    r"C:\Python314\python.exe -m disensor_cursor.hook --event stop",
+    r"C:\Python314\python.exe -m disensor_cursor.hook --event inventado --generated-by 0.2.0",
+    r"C:\Python314\python.exe -m disensor_cursor.hook --otro valor --event stop --generated-by x",
+    f'"python" -I -c "{templates.PROGRAM}" --event stop --generated-by 0.2.0',
+    templates.command_for("stop", r"C:\Python314\python.exe", "", None)
+    + " --config a.json --config b.json",
+])
+def test_this_hook_with_arguments_nobody_expected_is_still_ours(command):
+    """The plain `-m` form above is the one that imports from the current
+    directory. Left unrecognised, init installed the safe command next to it
+    and Cursor kept running both."""
+    assert templates.is_ours({"command": command})
+    merged = templates.merge_hooks(
+        {"version": 1, "hooks": {"stop": [{"command": command}]}},
+        templates.hooks_config(r"C:\Python314\python.exe", "", None),
+    )
+    assert len(merged["hooks"]["stop"]) == 1
+    assert " -I -c " in merged["hooks"]["stop"][0]["command"]
+
+
+_OURS = templates.command_for("stop", r"C:\Python314\python.exe", "", None)
+
+
+@pytest.mark.parametrize("command", [
+    # Codex, cuarta ronda: para un split ingenuo `0.2.0&whoami` era un valor,
+    # y para cmd.exe son dos comandos. Reconocida como nuestra, init y
+    # uninstall borraban el segundo junto con la entrada.
+    _OURS.replace(f"--generated-by {templates.__version__}", "--generated-by 0.2.0&whoami"),
+    _OURS + " & whoami",
+    _OURS + " | tee copia.txt",
+    _OURS + "; rm -rf x",
+    _OURS + " > salida.txt",
+    _OURS + " ^& whoami",
+    _OURS + ' --config "$(whoami).json"',
+    _OURS + ' --config "%USERNAME%.json"',
+    _OURS + ' --config "politica`whoami`.json"',
+    _OURS + ' --config "a!b.json"',
+    _OURS + ' --config "sin cerrar',
+    # Los que solo el chequeo de caracteres atrapa: la estructura esta bien,
+    # una bandera conocida con un valor, y el valor es media linea de cmd.exe.
+    _OURS + " --directory evidencia&whoami",
+    _OURS + " --config politica.json|more",
+    # La 0.1.0 escribia el interprete sin comillas cuando no tenia espacios.
+    r"C:\Py&whoami\python.exe -m disensor_cursor.hook --event stop --generated-by 0.1.0",
+    # Para sh la comilla escapada no abre nada, y el `&` queda afuera.
+    _OURS + r' --config a\" & whoami ; echo \"',
+])
+def test_a_command_that_does_more_than_ours_is_not_ours(command):
+    assert not templates.is_ours({"command": command})
+
+
+@pytest.mark.parametrize("location", ["", ".", "--event", r"C:\otra\parte"])
+def test_our_program_with_a_broken_directory_is_ours_so_init_replaces_it(location):
+    """`""` or `.` there would import the hook from the current directory.
+    Not recognised, init would leave that entry installed next to its own."""
+    command = (f'"C:\\Python314\\python.exe" -I -c "{templates.PROGRAM}" "{location}" '
+               f"--event stop --generated-by 0.2.0")
+    assert templates.is_ours({"command": command})
+    merged = templates.merge_hooks(
+        {"version": 1, "hooks": {"stop": [{"command": command}]}},
+        templates.hooks_config(r"C:\Python314\python.exe", "", None),
+    )
+    assert [e["command"] for e in merged["hooks"]["stop"]] == [
+        templates.command_for("stop", r"C:\Python314\python.exe", "", None)
+    ]
+
+
+def test_only_objects_can_be_ours():
+    assert not templates.is_ours("disensor_cursor.hook")
+    assert not templates.is_ours(None)
+
+
 def test_a_moved_package_is_still_recognised_so_init_replaces_it():
     """Reinstalling in another place changes the location in the command; the
     old entry has to be recognised or init would leave both."""
@@ -57,6 +170,7 @@ def test_paths_are_always_quoted():
     assert r'"C:\a&b\python.exe"' in command
     assert r'"C:\x^y\disensor.exe"' in command
     assert r'"C:\p(q)\site-packages"' in command
+    assert templates.is_ours({"command": command})
 
 
 @pytest.mark.parametrize("path", [
@@ -208,3 +322,67 @@ def test_the_hook_answers_without_being_pip_installed(tmp_path):
                 _environment(tmp_path))
     assert done.returncode == 0, done.stderr
     assert json.loads(done.stdout) == {}
+
+
+@pytest.mark.parametrize("command", [
+    # Lo que el README le dice al usuario que agregue, con y sin comillas, en
+    # cualquier orden, incluso despues de --generated-by.
+    _OURS + ' --config "policy files/p.json" --directory "review evidence"',
+    _OURS + " --directory evidencia",
+    r'"C:\Python314\python.exe" -E -P -m disensor_cursor.hook --config politica.json --event stop '
+    r"--generated-by 0.2.0",
+])
+def test_a_hook_the_user_configured_is_still_ours(command):
+    """Codex, third round: the README says to add --config or --directory, and
+    once added the hook stopped being recognised: doctor said nothing was
+    installed and init installed a second copy."""
+    assert templates.is_ours({"command": command})
+
+
+def _reinstalled(previous: str) -> str:
+    merged = templates.merge_hooks(
+        {"version": 1, "hooks": {"stop": [{"command": previous}]}},
+        templates.hooks_config(r"C:\Python314\python.exe", "", None),
+    )
+    [entry] = merged["hooks"]["stop"]
+    return entry["command"]
+
+
+def test_reinstalling_keeps_the_settings_the_readme_says_to_add():
+    """doctor tells you to re-run init after an upgrade, and init used to drop
+    --config and --directory without a word: the hook then asked disensor with
+    a policy that was not the repository's."""
+    previous = _OURS + ' --config "policy files/p.json" --directory evidencia'
+    command = _reinstalled(previous)
+    assert command.endswith(' --config "policy files/p.json" --directory "evidencia"')
+    assert templates.kept_settings({"command": command}) == [
+        ("--config", "policy files/p.json"), ("--directory", "evidencia"),
+    ]
+
+
+def test_only_those_settings_are_kept_and_the_last_one_wins():
+    previous = (_OURS + " --config a.json --otro valor --config b.json --base release"
+                + " --directory --config")
+    command = _reinstalled(previous)
+    assert templates.kept_settings({"command": command}) == [("--config", "b.json")]
+    assert "--otro" not in command and "release" not in command
+
+
+def test_an_entry_without_settings_is_regenerated_as_init_writes_it():
+    assert _reinstalled(_OURS) == _OURS
+
+
+def test_a_setting_that_cannot_be_written_back_stops_init_and_says_which():
+    """Dropping it would be the silent loss this carry-over exists to avoid.
+    Unquoted, since a quoted value ending in a backslash holds `\\"` and is
+    not recognised as ours at all."""
+    with pytest.raises(ValueError, match="stop hook carries a setting init cannot keep"):
+        _reinstalled(_OURS + " --directory evidencia\\")
+
+
+def test_what_init_writes_now_is_recognised_as_is():
+    for event in templates.EVENTS:
+        for base in (None, "origin/main"):
+            command = templates.command_for(event, r"C:\Program Files\Py\python.exe",
+                                            r"C:\Program Files\d\disensor.exe", base)
+            assert templates.is_ours({"command": command}), command

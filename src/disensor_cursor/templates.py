@@ -12,20 +12,19 @@ from pathlib import Path
 
 from . import __version__
 
-# El comando lleva esta marca para que `init` pueda reconocer SUS entradas
-# dentro de un hooks.json que ya tenga hooks de otra gente, y reemplazar solo
-# las propias.
+# El nombre del modulo que Cursor ejecuta. Aparece en cada comando nuestro,
+# pero NO alcanza para reconocerlo: una entrada ajena puede contener este texto
+# (`python audit.py --label disensor_cursor.hook`) y uninstall la borraba.
 MARKER = "disensor_cursor.hook"
 
 EVENTS = {
     "sessionStart": {"timeout": 5},
     "afterFileEdit": {"timeout": 5},
     # `loop_limit: 1` porque Cursor ya implementa el corte de la continuacion
-    # automatica: no hace falta programarlo. El corte por motivo que lleva el
-    # hook es otra cosa y resuelve otro problema.
+    # automatica: no hace falta programarlo. El corte por motivo y commit que
+    # lleva el hook es otra cosa y resuelve otro problema.
     "stop": {"timeout": 15, "loop_limit": 1},
 }
-
 
 # El programa que corre el interprete. Es siempre el mismo texto: la carpeta
 # del paquete llega como primer argumento y no dentro del programa, asi que
@@ -38,6 +37,11 @@ PROGRAM = (
 # Lo que algun shell expande incluso entre comillas dobles: `%` y `!` en
 # cmd.exe, `$` y el backtick en sh y en PowerShell. La comilla doble cierra.
 _EXPANDED = frozenset('"%!$`')
+
+# Lo que puede ir sin comillas y significa lo mismo en cmd.exe y en sh. Ni `,`
+# ni `=`: cmd.exe los trata como separadores en algunos lugares, y sh lee un
+# `X=y` al principio como una asignacion.
+_PLAIN = frozenset("_.:/\\@+~-")
 
 
 def package_location() -> str:
@@ -70,8 +74,9 @@ def _quote(text: str) -> str:
 def is_interpreter(path: str) -> bool:
     """Whether a program path names a Python interpreter.
 
-    What init writes first is `sys.executable`, and nothing else: it refuses
-    to put any other program there.
+    What init writes first is `sys.executable`, and nothing else: an entry
+    whose first word is `echo` or any other program is somebody else's, even
+    when the rest of its line looks like ours.
     """
     name = re.split(r"[\\/]", path)[-1].lower()
     if name.endswith(".exe"):
@@ -106,16 +111,155 @@ def _entry(python: str, location: str) -> list[str]:
     return [interpreter, "-I", "-c", f'"{PROGRAM}"', _quote(location)]
 
 
+def _with_settings(command: str, kept) -> str:
+    return " ".join([command, *(f"{flag} {_quote(value)}" for flag, value in kept)])
+
+
 def command_for(
-    event: str, python: str, disensor: str, base: str | None, location: str | None = None,
+    event: str, python: str, disensor: str, base: str | None,
+    location: str | None = None, kept=(),
 ) -> str:
+    """The command init writes for one event.
+
+    `kept` are the settings the user added to a previous entry (see
+    `kept_settings`), carried to the end of the new one.
+    """
     parts = [*_entry(python, location or package_location()), "--event", event]
     if disensor:
         parts += ["--disensor", _quote(disensor)]
     if base:
         parts += ["--base", base]
     parts += ["--generated-by", __version__]
-    return " ".join(parts)
+    return _with_settings(" ".join(parts), kept)
+
+
+# Como arranca el interprete en cada forma que escribio alguna version: la de
+# hoy, con la carpeta del paquete como argumento (`None` en el patron), las de
+# los borradores de 0.2.0 y la de 0.1.0, sin -E ni -P. Las formas -c exigen el
+# programa EXACTO: con comodines alrededor del import, una entrada ajena que
+# solo imprimia ese texto pasaba por nuestra y uninstall la borraba.
+_SAFE_ENTRY_310 = (
+    "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]; "
+    f"from {MARKER} import main; sys.exit(main())"
+)
+_ENTRIES = (
+    ("-I", "-c", PROGRAM, None),
+    ("-E", "-P", "-m", MARKER),
+    ("-P", "-m", MARKER),
+    ("-E", "-m", MARKER),
+    ("-m", MARKER),
+    ("-E", "-c", _SAFE_ENTRY_310),
+    ("-c", _SAFE_ENTRY_310),
+)
+
+# Lo que el README le dice al usuario que agregue a mano, y que init conserva
+# al regenerar: descartarlo en silencio hacia que el hook le preguntara a
+# disensor con otra politica que la del repositorio.
+KEPT_SETTINGS = ("--config", "--directory")
+
+
+def _tokens(command: str) -> list[str] | None:
+    """Split a command line on spaces outside double quotes, quotes removed.
+
+    None for anything init never writes: a quote left open, a character
+    outside quotes that some shell treats as syntax (`&`, `|`, `;`, `(`...),
+    or one inside quotes that some shell still expands. The first case matters
+    most. `--generated-by 0.2.0&whoami` is a single token to a naive split and
+    two commands to cmd.exe, and recognising the line as ours meant init and
+    uninstall deleted the second command along with ours.
+    """
+    if '\\"' in command:
+        # Una comilla despues de una barra invertida es literal para sh y para
+        # el argv de Windows, y para cmd.exe abre o cierra. Con eso
+        # `a\" & whoami ; echo \"` era un comando aca y dos para sh. init
+        # nunca la escribe: ningun valor lleva comillas ni termina en barra.
+        return None
+    tokens: list[str] = []
+    current: list[str] = []
+    quoted = False
+    started = False
+    for ch in command:
+        if ch == '"':
+            quoted = not quoted
+            started = True
+        elif ch == " " and not quoted:
+            if started:
+                tokens.append("".join(current))
+            current, started = [], False
+        elif quoted and (ch in _EXPANDED or not ch.isprintable()):
+            return None
+        elif not quoted and not (ch.isalnum() or ch in _PLAIN):
+            return None
+        else:
+            current.append(ch)
+            started = True
+    if quoted:
+        return None
+    if started:
+        tokens.append("".join(current))
+    return tokens
+
+
+def _after_entry(rest: list[str]) -> list[str] | None:
+    """What follows the interpreter's own options, or None if no known entry fits.
+
+    The package directory matches any token, even an empty or a relative one.
+    That is deliberate: an entry that runs this program with a broken
+    directory runs the hook, and one with `""` or `.` there would import it
+    from the current directory. Recognising it as ours is what gets it
+    replaced by init and removed by uninstall; not recognising it would leave
+    it installed next to the right one.
+    """
+    for shape in _ENTRIES:
+        if len(rest) >= len(shape) and all(
+            want is None or want == got for want, got in zip(shape, rest)
+        ):
+            return rest[len(shape):]
+    return None
+
+
+def _arguments(entry) -> list[str] | None:
+    """What an entry of ours passes to the hook, or None if it is not ours."""
+    if not isinstance(entry, dict):
+        return None
+    tokens = _tokens(str(entry.get("command", "")))
+    if not tokens or len(tokens) < 2 or not is_interpreter(tokens[0]):
+        return None
+    return _after_entry(tokens[1:])
+
+
+def is_ours(entry) -> bool:
+    """Whether a hooks.json entry is a single command that runs this hook.
+
+    Three conditions, and only three. The line is one command: nothing outside
+    quotes that a shell reads as syntax, nothing inside them that a shell
+    expands. Its first word is a Python interpreter, by name: `echo -m
+    disensor_cursor.hook ...` only prints. And that interpreter starts one of
+    the entries some version of init wrote, recognised token by token, so an
+    entry that merely mentions the module name belongs to somebody else and is
+    kept.
+
+    What follows is not checked, on purpose. An entry that runs this hook with
+    arguments nobody expected, or through the old `-m` form that imports from
+    the current directory, is still this hook, and recognising it is what gets
+    it replaced by init and removed by uninstall. Checking the arguments too
+    left exactly those entries installed next to the right one.
+    """
+    return _arguments(entry) is not None
+
+
+def kept_settings(entry) -> list[tuple[str, str]]:
+    """The `--config` and `--directory` an entry of ours carries.
+
+    Read the way the hook reads its flags: a flag followed by a value that is
+    not itself a flag, the last occurrence winning.
+    """
+    rest = _arguments(entry) or []
+    found: dict[str, str] = {}
+    for flag, value in zip(rest, rest[1:]):
+        if flag in KEPT_SETTINGS and not value.startswith("--"):
+            found[flag] = value
+    return list(found.items())
 
 
 def hooks_config(
@@ -149,11 +293,14 @@ def merge_hooks(existing: dict, generated: dict) -> dict:
     hooks = dict(result.get("hooks") or {})
     for event, entries in generated["hooks"].items():
         previous = hooks.get(event)
-        others = [
-            e for e in previous
-            if isinstance(e, dict) and MARKER not in str(e.get("command", ""))
-        ] if isinstance(previous, list) else []
-        hooks[event] = others + entries
+        previous = previous if isinstance(previous, list) else []
+        kept = next((k for k in map(kept_settings, previous) if k), [])
+        others = [e for e in previous if not is_ours(e)]
+        try:
+            fresh = [{**e, "command": _with_settings(e["command"], kept)} for e in entries]
+        except ValueError as exc:
+            raise ValueError(f"the installed {event} hook carries a setting init cannot keep: {exc}") from exc
+        hooks[event] = others + fresh
     result["hooks"] = hooks
     return result
 
