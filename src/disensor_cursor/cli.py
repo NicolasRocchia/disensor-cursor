@@ -19,11 +19,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import sys
 from pathlib import Path
 
-from . import __version__, disensor, gitio, state, templates
+from . import __version__, disensor, executables, gitio, state, templates
 
 USER_HOOKS = Path.home() / ".cursor" / "hooks.json"
 
@@ -40,11 +39,49 @@ def _resolve_python() -> str:
     return os.path.abspath(sys.executable)
 
 
+def _repository_content(path: Path) -> str:
+    """Why a program found on PATH is repository content, or "" if it is not.
+
+    What init resolves is written into hooks.json and runs in every later
+    session, in every repository. One committed to the repository it lives in
+    came from somebody else's history, and a PATH entry pointing at it would
+    make that history run everywhere. A disensor in an untracked virtualenv
+    inside some checkout is the user's own install, and is not refused. The
+    repository init runs from is already excluded from PATH (see `main`).
+
+    The git that answers comes from outside the repository being asked
+    about, and only its two meaningful answers count: a git from inside it
+    answered with an error, and the error read as "not committed".
+    """
+    repository = executables.enclosing_repository(path.parent)
+    if repository is None:
+        return ""
+    try:
+        code, _, err = gitio.run_git(
+            ["ls-files", "--error-unmatch", "--", path.name], path.parent, exclude=(repository,),
+        )
+    except gitio.GitUnavailable as exc:
+        return f"whether the repository at {repository} commits it could not be checked ({exc})"
+    if code == 0:
+        return "it is committed to the repository it lives in"
+    if code == 1:
+        return ""
+    return f"whether the repository at {repository} commits it could not be checked (git exited {code})"
+
+
 def _resolve_disensor() -> tuple[str, str]:
-    found = shutil.which("disensor")
+    # Desde el PATH y nunca el cwd: `init` se corre adentro de un repositorio,
+    # y lo que resuelva aca queda escrito en hooks.json para cada corrida.
+    found = executables.find("disensor")
     if not found:
         return "", "disensor is not on PATH. Install it first: pip install disensor"
     path = os.path.abspath(found)
+    reason = _repository_content(Path(path))
+    if reason:
+        return path, (
+            f"found at {path}, but {reason}: the hooks would run repository content in every "
+            "session. Install disensor outside any repository (pip install --user disensor, or pipx)"
+        )
     ok, detail = disensor.probe(Path(path))
     if not ok:
         return path, f"found at {path}, but it does not answer as expected: {detail}"
@@ -247,4 +284,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    # Lo mismo que hace el hook: los programas no salen del repositorio desde
+    # el que se corre el comando. `init` resuelve ahi el disensor que despues
+    # corre en cada sesion.
+    executables.declare_project(executables.enclosing_repository(Path.cwd()))
     sys.exit(args.func(args))

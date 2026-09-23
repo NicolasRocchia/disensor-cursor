@@ -28,7 +28,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import __version__, clock, disensor, families, gitio, state
+from . import __version__, clock, disensor, executables, families, gitio, state
 
 CONFIG_NAME = "disensor.config.json"
 EVIDENCE_ROOT = ".residue"
@@ -105,6 +105,13 @@ def _worktree(payload: dict) -> Path | None:
     User-level hooks run with `~/.cursor` as their cwd, so the project has to
     come from the environment Cursor sets, not from where the process happens
     to be standing.
+
+    Whatever is taken as the project is declared before git runs, together
+    with the repository each of those folders sits in, and the root git
+    reports once it answers: no program may come from inside any of them (see
+    executables.py). Only CURSOR_PROJECT_DIR used to count, so without it the
+    hook found the project through the payload or the cwd and then ran a
+    `git.exe` from a PATH entry inside that same project.
     """
     roots = payload.get("workspace_roots")
     roots = [r for r in roots if isinstance(r, str) and r] if isinstance(roots, list) else []
@@ -114,7 +121,12 @@ def _worktree(payload: dict) -> Path | None:
         or (roots[0] if roots else None)
         or str(Path.cwd())
     )
-    return gitio.repo_root(Path(candidate))
+    places = [candidate, *roots]
+    executables.declare_project(*places, *(executables.enclosing_repository(p) for p in places))
+    repo = gitio.repo_root(Path(candidate))
+    if repo is not None:
+        executables.declare_project(repo)
+    return repo
 
 
 def _config(options: dict) -> str:
@@ -511,7 +523,7 @@ def _stop(payload: dict, options: dict) -> tuple[dict, object]:
 
     executable = disensor.locate(options.get("disensor"), repo)
     if executable is None:
-        state.note(f"{repo}: disensor not found; run `disensor-cursor doctor`")
+        state.note(f"{repo}: {disensor.why_not(options.get('disensor'))}")
         return {}, None
 
     evidence_root = _evidence_root(options)
@@ -604,6 +616,7 @@ def main(argv: list[str] | None = None) -> int:
         except BaseException:  # noqa: BLE001
             state.note("could not persist the notice:\n" + traceback.format_exc())
     clock.reset()
+    executables.forget_projects()
     return 0
 
 

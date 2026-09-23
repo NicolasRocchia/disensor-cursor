@@ -125,3 +125,84 @@ def test_the_rule_is_only_written_for_a_project_install(monkeypatch, tmp_path, c
     monkeypatch.chdir(repo)
     run(["init"], monkeypatch, tmp_path)
     assert not (repo / ".cursor").exists()
+
+
+def _planted_disensor(directory, mark):
+    """A disensor.cmd that leaves a mark if anything runs it, the probe included."""
+    directory.mkdir(parents=True, exist_ok=True)
+    plantado = directory / "disensor.cmd"
+    plantado.write_bytes(f'@echo off\r\ntype nul > "{mark}"\r\necho --check\r\n'.encode("utf-8"))
+    return plantado
+
+
+def _main(monkeypatch, *argv) -> int:
+    """The command as it is really run, through `main` and its exit code."""
+    import sys
+
+    monkeypatch.setattr(sys, "argv", ["disensor-cursor", *argv])
+    with pytest.raises(SystemExit) as salida:
+        cli.main()
+    return salida.value.code
+
+
+def test_init_never_writes_a_disensor_from_the_repository(monkeypatch, tmp_path, capsys, repo):
+    """Codex, fifth round: init resolved disensor through a PATH entry inside
+    the repository it ran from, probed it, and wrote it into the hooks of every
+    session. Run from there, the command now leaves the repository out of
+    PATH, as the hook does."""
+    import os
+    import sys
+    from pathlib import Path
+
+    from disensor_cursor import executables
+
+    if sys.platform != "win32":
+        pytest.skip("the planted program is a .cmd script")
+    marca = tmp_path / "ejecutado.txt"
+    plantado = _planted_disensor(repo / "bin", marca)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(repo / "bin"), os.environ["PATH"]]))
+    monkeypatch.chdir(repo)
+    assert Path(executables.find("disensor")) == plantado, "the premise: it is first on PATH"
+
+    monkeypatch.setattr(cli, "USER_HOOKS", tmp_path / "casa" / ".cursor" / "hooks.json")
+    _main(monkeypatch, "init", "--force")
+    assert not marca.exists(), "not even probed"
+    if cli.USER_HOOKS.exists():
+        assert str(plantado) not in cli.USER_HOOKS.read_text(encoding="utf-8")
+
+
+def test_init_never_writes_a_disensor_committed_to_another_repository(monkeypatch, tmp_path, capsys, repo):
+    """And the git that checks it comes from outside that repository. Codex,
+    sixth round: a `git.cmd` next to the planted disensor answered with an
+    error, the error read as "not committed", and both ran."""
+    import os
+    import sys
+
+    from conftest import git
+
+    if sys.platform != "win32":
+        pytest.skip("the planted programs are .cmd scripts")
+    marca = tmp_path / "ejecutado.txt"
+    _planted_disensor(repo / "bin", marca)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "planta un disensor")
+    (repo / "bin" / "git.cmd").write_bytes(f'@echo off\r\ntype nul > "{marca}"\r\nexit /b 1\r\n'.encode())
+    monkeypatch.setenv("PATH", os.pathsep.join([str(repo / "bin"), os.environ["PATH"]]))
+    monkeypatch.chdir(tmp_path)
+    path, problem = cli._resolve_disensor()
+    assert "committed to the repository" in problem
+    assert not marca.exists(), "neither the planted git nor the planted disensor ran"
+
+
+def test_a_commit_check_that_cannot_answer_is_not_read_as_not_committed(tmp_path):
+    """Only exit 0 (committed) and 1 (not committed) are answers. A `.git`
+    that git does not take for a repository makes it exit 128, and that is
+    "could not check", which refuses."""
+    from pathlib import Path
+
+    falso = tmp_path / "falso"
+    (falso / ".git").mkdir(parents=True)
+    (falso / "bin").mkdir()
+    programa = falso / "bin" / "disensor.cmd"
+    programa.write_bytes(b"@echo off\r\n")
+    assert "could not be checked" in cli._repository_content(Path(programa))

@@ -176,3 +176,110 @@ def test_the_check_runs_on_a_dirty_tree_and_touches_nothing(tmp_path):
     before = git(root, "status", "--porcelain=v1", "--untracked-files=all")
     assert ask(root).verdict == disensor.REQUIRED
     assert git(root, "status", "--porcelain=v1", "--untracked-files=all") == before
+
+
+# --- lo que el hook le pasa a disensor no puede apuntar al repositorio -----
+
+def _plant_disensor(root: Path, mark: Path) -> None:
+    """A `disensor` package in the checkout that leaves a mark when imported."""
+    paquete = root / "disensor"
+    paquete.mkdir()
+    (paquete / "__init__.py").write_text(f"open(r'{mark}', 'w').close()\n", encoding="utf-8")
+    (paquete / "cli.py").write_text("def main():\n    raise SystemExit(0)\n", encoding="utf-8")
+
+
+def test_without_protection_a_relative_pythonpath_runs_the_checkouts_disensor(tmp_path):
+    """Codex, third round: the hook's own interpreter ignores PYTHONPATH, but
+    disensor's launcher does not, and it used to inherit it. Proven here first."""
+    root = make_repo(tmp_path, BASIC)
+    commit(root, {"src/app.py": "x = 2\n"})
+    mark = tmp_path / "importado.txt"
+    _plant_disensor(root, mark)
+    subprocess.run([str(EXE), "round", "--help"], cwd=root, capture_output=True, check=False,
+                   env={**os.environ, "PYTHONPATH": "."})
+    assert mark.exists()
+
+
+def test_the_check_never_imports_the_checkouts_disensor(tmp_path, monkeypatch):
+    root = make_repo(tmp_path, BASIC)
+    commit(root, {"src/app.py": "x = 2\n"})
+    mark = tmp_path / "importado.txt"
+    _plant_disensor(root, mark)
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "planta un disensor")
+    monkeypatch.setenv("PYTHONPATH", ".")
+    assert ask(root).verdict == disensor.REQUIRED
+    assert not mark.exists(), "disensor imported the package planted in the checkout"
+
+
+def test_the_check_never_runs_the_checkouts_git(tmp_path, monkeypatch):
+    """Codex, third round: a `.` in PATH survives NoDefaultCurrentDirectory,
+    and disensor calls git by bare name. The planted git.exe is a copy of
+    whoami, so if disensor ran it the check could not answer."""
+    import sys
+
+    if sys.platform != "win32":
+        pytest.skip("the planted .exe is a Windows scenario")
+    whoami = shutil.which("whoami", path=os.path.join(os.environ["SystemRoot"], "System32"))
+    if not whoami:
+        pytest.skip("no whoami.exe to plant")
+    root = make_repo(tmp_path, BASIC)
+    commit(root, {"src/app.py": "x = 2\n"})
+    # Los OIDs antes de plantar: los helpers de este test llaman a git por
+    # nombre pelado desde el repositorio, y despues ejecutarian el plantado.
+    base = git(root, "rev-parse", "origin/main")
+    head = git(root, "rev-parse", "HEAD")
+    shutil.copy(whoami, root / "git.exe")
+    monkeypatch.delenv("NoDefaultCurrentDirectoryInExePath", raising=False)
+    monkeypatch.setenv("PATH", "." + os.pathsep + os.environ["PATH"])
+
+    def unprotected():
+        return subprocess.run(
+            [str(EXE), "round", "--gate", "diff", "--generator-family", "other",
+             "--base", base, "--head", head, "--check"],
+            cwd=root, capture_output=True, check=False, env=dict(os.environ),
+        )
+
+    # Codex, cuarta ronda: que falle no prueba por si solo que corrio el
+    # plantado. El control es la misma invocacion, mismo entorno, sin el
+    # archivo: si esa responde, lo unico que cambio es el git.exe.
+    sin_proteccion = unprotected()
+    (root / "git.exe").unlink()
+    control = unprotected()
+    shutil.copy(whoami, root / "git.exe")
+    assert control.returncode == disensor.OK, "the control: the same call answers without the plant"
+    assert sin_proteccion.returncode == disensor.ERROR, "the premise: disensor ran the planted git"
+    assert disensor.check_requirement(EXE, root, base, head).verdict == disensor.REQUIRED
+
+
+def _plant_pth(root: Path, mark: Path) -> None:
+    """A .pth in every user site-packages PYTHONUSERBASE=. could point at.
+
+    The interpreter behind the disensor launcher is not known from here, so
+    every version this adapter supports gets one.
+    """
+    line = f"import os; open(r'{mark}', 'w').close()\n"
+    for minor in range(10, 16):
+        for relative in (f"Python3{minor}/site-packages", f"lib/python3.{minor}/site-packages"):
+            directory = root / relative
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "ataque.pth").write_text(line, encoding="utf-8")
+
+
+def test_the_check_never_runs_a_pth_from_the_checkout(tmp_path, monkeypatch):
+    """Codex, fourth round: the launcher runs Python with its user site on, and
+    PYTHONUSERBASE=. puts that site inside the checkout, where site.py runs
+    the .pth files it finds before disensor is even imported."""
+    root = make_repo(tmp_path, BASIC)
+    commit(root, {"src/app.py": "x = 2\n"})
+    mark = tmp_path / "pth.txt"
+    _plant_pth(root, mark)
+    subprocess.run([str(EXE), "round", "--help"], cwd=root, capture_output=True, check=False,
+                   env={**os.environ, "PYTHONUSERBASE": "."})
+    if not mark.exists():
+        pytest.skip("this disensor runs without a user site-packages (from a venv): no attack to stop")
+    mark.unlink()
+
+    monkeypatch.setenv("PYTHONUSERBASE", ".")
+    assert ask(root).verdict == disensor.REQUIRED
+    assert not mark.exists(), "disensor's interpreter ran a .pth from the checkout"

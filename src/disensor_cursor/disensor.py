@@ -11,12 +11,11 @@ with, and can say so when it does not.
 from __future__ import annotations
 
 import re
-import shutil
 import subprocess
 from pathlib import Path
 from typing import NamedTuple
 
-from . import clock, gitio
+from . import clock, executables, gitio
 
 # Los codigos que publica `disensor round`, estables dentro de una serie mayor.
 OK = 0
@@ -75,21 +74,35 @@ def locate(hint: str | None = None, repo: Path | None = None) -> Path | None:
     runs with the repository as its cwd. A repository shipping its own
     `disensor.cmd` would otherwise choose the program that runs.
 
-    When falling back to the search, anything resolving inside the repository
-    under review is refused for the same reason.
+    Absolute does not mean outside the repository, though: init may have
+    found disensor through a PATH entry that points into one. So the hint, like
+    the search, is refused when it lies inside the project or the repository
+    under review, and `why_not` says so.
     """
     if hint:
         candidate = Path(hint)
-        if candidate.is_file():
-            return candidate
-        return None
-    found = shutil.which("disensor")
+        if not candidate.is_file():
+            return None
+        if executables.inside_project(candidate) or (repo is not None and gitio.inside(candidate, repo)):
+            return None
+        return candidate
+    found = executables.find("disensor")
     if not found:
         return None
     resolved = Path(found)
     if repo is not None and gitio.inside(resolved, repo):
         return None
     return resolved
+
+
+def why_not(hint: str | None) -> str:
+    """Why `locate` found nothing, for the log `status` shows."""
+    if hint and Path(hint).is_file():
+        return (f"disensor at {hint} lies inside the project, and the hook never runs a program "
+                "from there; install it outside (pip install --user disensor, or pipx)")
+    if hint:
+        return f"disensor is no longer at {hint}, where init found it; run `disensor-cursor doctor`"
+    return "disensor not found on PATH outside the project; run `disensor-cursor doctor`"
 
 
 MIN_CALL = 0.5
@@ -105,6 +118,7 @@ def _run(executable: Path, args: list[str], cwd: Path, timeout: float) -> tuple[
         done = subprocess.run(
             [str(executable), *args],
             cwd=str(cwd), capture_output=True, timeout=budget, check=False,
+            env=executables.child_environment(),
         )
     except subprocess.TimeoutExpired:
         return -1, "", f"disensor did not answer within {budget:.1f}s"

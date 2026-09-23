@@ -17,7 +17,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from disensor_cursor import state  # noqa: E402
+from disensor_cursor import executables, state  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -25,6 +25,14 @@ def isolated_state(tmp_path, monkeypatch):
     directory = tmp_path / "estado"
     monkeypatch.setattr(state, "STATE_DIR", directory)
     return directory
+
+
+@pytest.fixture(autouse=True)
+def no_declared_projects():
+    """What a test declares as its project does not leak into the next one."""
+    executables.forget_projects()
+    yield
+    executables.forget_projects()
 
 
 def git(repo: Path, *args: str) -> str:

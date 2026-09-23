@@ -1,11 +1,19 @@
 """The git this adapter needs, read the way disensor reads it.
 
-Three things here are not stylistic.
+Four things here are not stylistic.
 
-The cleanliness check uses the flags of `round.STATUS_ARGS`. A plain
-`git status --porcelain` honours user configuration that can hide untracked
-files and dirty submodules, so the adapter would announce a tree ready for a
-round that `disensor round` then refuses.
+The cleanliness check uses the flags of `round.STATUS_ARGS`, with one
+deliberate exception. A plain `git status --porcelain` honours user
+configuration that can hide untracked files, so the adapter would announce a
+tree ready for a round that `disensor round` then refuses. The exception is
+submodules: see STATUS_ARGS.
+
+`git status` is also the one call here that can run programs a configuration
+names: an fsmonitor command, which the environment switches off (see
+executables.py), and the clean filter of whatever driver `.gitattributes`
+assigns. Filters are switched off for that call, every driver any
+configuration defines, whatever its scope: a filter the user installed can
+run commands the repository configures, as git-lfs does with its extensions.
 
 Every call draws from the run's single budget (see clock.py). disensor's own
 `gitctx._git` has no timeout, which is right for CI and wrong inside an agent
@@ -27,17 +35,23 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from . import clock
+from . import clock, executables
 
-# Los mismos flags que usa el runner de disensor. `--ignore-submodules=none`
-# porque sin el un submodulo sucio pasa desapercibido, y `--untracked-files=all`
-# porque la configuracion del usuario puede cambiar el default. `--no-renames`
-# no cambia si el arbol esta sucio o no, y deja una ruta por entrada: sin el,
-# un renombre ocupa dos campos y el parser tendria que adivinar cual leer.
+# Los flags del runner de disensor, salvo uno. `--untracked-files=all` porque
+# la configuracion del usuario puede cambiar el default. `--no-renames` no
+# cambia si el arbol esta sucio o no, y deja una ruta por entrada: sin el, un
+# renombre ocupa dos campos y el parser tendria que adivinar cual leer.
+#
+# `--ignore-submodules=dirty` y no el `none` de disensor: con `none`, git
+# corre otro `git status` adentro de cada submodulo, con la configuracion
+# propia de ese submodulo, y esa configuracion puede definir un filtro que git
+# ejecuta. Se comprobo corriendolo. Con `dirty` se sigue viendo cuando un
+# submodulo apunta a otro commit; lo que se pierde son los cambios sin
+# commitear adentro de un submodulo, que `disensor round` si va a ver.
 STATUS_ARGS = [
     "status", "--porcelain=v1", "-z",
     "--untracked-files=all",
-    "--ignore-submodules=none",
+    "--ignore-submodules=dirty",
     "--no-renames",
 ]
 
@@ -52,29 +66,64 @@ class GitUnavailable(Exception):
     """git could not answer. Never a reason to block the agent."""
 
 
-def run_git(args: list[str], cwd: Path, timeout: float = DEFAULT_TIMEOUT) -> tuple[int, str, str]:
+def _with_config(env: dict[str, str], config) -> dict[str, str]:
+    """`env` plus configuration for one call, through GIT_CONFIG_COUNT.
+
+    That channel and not `-c`: `-c` splits at the first `=`, and a driver name
+    can hold one. It overrides every configuration file; only the user's own
+    `git -c` settings rank above it.
+    """
+    if not config:
+        return env
+    try:
+        count = int(env.get("GIT_CONFIG_COUNT") or 0)
+    except ValueError:
+        count = 0
+    for index, (key, value) in enumerate(config, start=count):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
+    env["GIT_CONFIG_COUNT"] = str(count + len(config))
+    return env
+
+
+def run_git(
+    args: list[str], cwd: Path, timeout: float = DEFAULT_TIMEOUT, config=(),
+    exclude=(), raw: bool = False,
+) -> tuple[int, str, str]:
     """Run git, never raising for a non-zero exit code.
 
     `--no-optional-locks` because this runs in the background while the user
     works: git itself recommends it so a read does not take the index lock out
-    from under the editor. `--literal-pathspecs` because disensor's gate uses
+    from under the editor, and without the lock `status` never writes the
+    index, so no hook runs. `--literal-pathspecs` because disensor's gate uses
     it on every call: a path is a path, never pathspec magic such as `:(top)`.
+    The environment switches off the fsmonitor command and lazy fetches,
+    `config` adds settings for this call only, and `exclude` directories git
+    itself may not come from. With `raw`, stdout comes back as the bytes git
+    wrote, for the one caller that cannot afford a replacement character.
     """
     budget = clock.left(timeout)
     if budget < MIN_CALL:
         raise GitUnavailable(f"no time left for git {args[0]}")
+    # Ruta absoluta desde el PATH y nunca el nombre pelado: en Windows un
+    # `git.exe` en el directorio actual, que en los hooks de proyecto es el
+    # repositorio, se ejecutaria antes que el instalado.
+    git = executables.find("git", exclude)
+    if git is None:
+        raise GitUnavailable("git is not on PATH")
     try:
         done = subprocess.run(
-            ["git", "--no-optional-locks", "--literal-pathspecs", *args],
+            [git, "--no-optional-locks", "--literal-pathspecs", *args],
             cwd=str(cwd), capture_output=True, timeout=budget, check=False,
+            env=_with_config(executables.child_environment(), config),
         )
     except subprocess.TimeoutExpired as exc:
         raise GitUnavailable(f"git {args[0]} timed out after {budget:.1f}s") from exc
     except OSError as exc:
         raise GitUnavailable(f"git could not run: {exc}") from exc
-    out = (done.stdout or b"").decode("utf-8", "replace")
+    out = done.stdout or b""
     err = (done.stderr or b"").decode("utf-8", "replace")
-    return done.returncode, out, err
+    return done.returncode, (out if raw else out.decode("utf-8", "replace")), err
 
 
 def _fields(out: str) -> list[str]:
@@ -88,13 +137,60 @@ def repo_root(cwd: Path) -> Path | None:
     return Path(out.strip())
 
 
+def configured_filters(repo: Path) -> list[str]:
+    """Every filter driver some configuration names, whatever its scope.
+
+    Every scope, and not only the repository's: a filter the user installed
+    can run what the repository configures. git-lfs, which Git for Windows
+    ships in its system configuration, runs the `lfs.extension.*` commands of
+    `.git/config` on every clean. Includes are followed.
+
+    Raises GitUnavailable when the configuration cannot be read at all, a
+    malformed `.git/config` for instance, or when a driver is named in bytes
+    that are not UTF-8: read with replacement characters that is another
+    name, and switching that one off left the real driver running. Only the
+    names are decoded that strictly; a value is never used.
+    """
+    code, out, err = run_git(["config", "--null", "--get-regexp", r"^filter\."], repo, raw=True)
+    if code == 1 and not out:
+        return []
+    if code != 0:
+        detail = err.strip().splitlines()[-1] if err.strip() else f"exit {code}"
+        raise GitUnavailable(f"could not read the repository's git configuration ({detail})")
+    names = set()
+    # Con --null cada entrada es `clave\nvalor\0`, y la clave, filter.<nombre>.<variable>.
+    for entry in out.split(b"\0"):
+        key = entry.split(b"\n", 1)[0]
+        if not key.startswith(b"filter.") or key.count(b".") < 2:
+            continue
+        try:
+            names.add(key[len(b"filter."):].rsplit(b".", 1)[0].decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise GitUnavailable(
+                "the git configuration names a filter driver in bytes that are not UTF-8, so it "
+                "cannot be switched off by name; the tree was not checked"
+            ) from exc
+    return sorted(names)
+
+
 def dirty_paths(repo: Path) -> set[str] | None:
     """Every path git reports as changed, staged or untracked. None if git failed.
 
     Each `-z` entry is two status letters, a space and the path, and with
     `--no-renames` there is never a second path to consume.
+
+    No filter runs: `git status` would run the clean command of a file whose
+    timestamps changed, and `.gitattributes` decides which files those are.
+    Without `required` a missing command is not an error, so the check still
+    answers. The cost is that such a file, under git-lfs for instance, shows
+    up as changed until its timestamps are refreshed, even when only they did.
     """
-    code, out, _ = run_git(STATUS_ARGS, repo)
+    neutral = [
+        (f"filter.{name}.{variable}", value)
+        for name in configured_filters(repo)
+        for variable, value in (("clean", ""), ("process", ""), ("required", "false"))
+    ]
+    code, out, _ = run_git(STATUS_ARGS, repo, config=neutral)
     if code != 0:
         return None
     return {entry[3:] for entry in out.split("\0") if len(entry) > 3}
