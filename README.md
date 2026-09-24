@@ -83,8 +83,8 @@ Three hooks, all advisory:
 
 | Hook | What it does |
 |---|---|
-| `sessionStart` | Decides whether the session is eligible, notes where it started (the head and what was already uncommitted), and tells the agent the method exists. |
-| `afterFileEdit` | Records which path the agent's edit tool changed, and with which model. Metadata only. |
+| `sessionStart` | Takes the session in, pending, when the repository adopted disensor and it is not a background agent; notes where it started (the head and what was already uncommitted), and tells the agent the method exists. |
+| `afterFileEdit` | Records which path the agent's edit tool changed, and with which model. Metadata only. The first edit admits the session. |
 | `stop` | If this session changed code that still owes a review, adds a notice about it. |
 
 When the notice fires, the agent gets told what the state is and asked to
@@ -93,6 +93,15 @@ both of those are yours to authorise.
 
 ## How it decides
 
+**Which sessions it watches** is decided by evidence, not by the mode Cursor
+reports. Cursor 3.21 sends the same `composer_mode` (`chat`) for Ask and for
+the agent, while its documentation still lists `agent`, `ask` and `edit`, so a
+first version that required `agent` stayed mute there. A session is taken in
+pending when the repository adopted disensor and it is not a background agent,
+and the first edit the agent makes admits it. An Ask conversation never edits
+and never gets a notice. A session with no `sessionStart`, which is the case of
+cloud agents, is never taken in.
+
 **What the session changed** comes from three places, because each one alone
 is blind somewhere: the paths the edit tool touched, what became uncommitted
 since the session started (so edits made from a terminal count), and what was
@@ -100,7 +109,10 @@ committed since then (so work already out of the tree counts). A session that
 changed nothing gets no notice and never costs a call to disensor; seeing that
 it changed nothing takes a few git reads, since a terminal edit only shows up
 in git. A new session starts from nothing: it does not inherit the edits of
-the previous one in the same conversation.
+the previous one in the same conversation, and an edit or a `stop` of that one
+that arrives late does not count for it either. Every event is matched to its
+session, and whatever depends on the state is decided under the lock that
+writes it, with the one exception Known limits describes.
 
 **Whose uncommitted changes they are** is told by timing, not by authorship.
 The notice about a dirty tree names what appeared during this session and does
@@ -285,7 +297,20 @@ configuration, entering submodules and taking the index lock.
   content. Edits made through the agent's edit tool are always seen.
 - **Edits made before `sessionStart` lands** can be missed. Cursor documents
   `sessionStart` as fire-and-forget, so an edit that arrives before the session
-  is admitted is not recorded; it still counts once it is committed.
+  is taken in is not recorded and does not admit it. That work still counts if
+  a later edit admits the session and it is committed after `sessionStart` took
+  its starting point; a commit made before that is part of the starting point.
+- **A session that changes code only through the terminal gets no notices.**
+  Admission needs one edit through the agent's edit tool (see How it decides),
+  and a session whose every change went through a shell command, a script or
+  `git apply` is never admitted. Once a session is admitted, its terminal edits
+  and commits do count.
+- **A hook that stalls holding the lock can cross decisions.** The state lock
+  is waited for two seconds at most, because blocking Cursor is worse, and past
+  that the waiting hook goes ahead. A hook that stalls longer than that while
+  holding it can lose an admission, which then waits for the session's next
+  edit, or write an admission over a rejection. The lock is normally held for
+  the milliseconds it takes to read and write a small file.
 - **The accepted gates come from prose.** `round --check` prints them on a
   line that disensor does not promise to keep. The contract test pins today's
   wording, and when the line cannot be read the notice falls back to a diff
@@ -293,13 +318,24 @@ configuration, entering submodules and taking the index lock.
 - **The model reported by Cursor is provenance, not proof.** A session can
   switch models, and a commit range can hold work from other hands. When the
   session's edits do not agree on one model, nothing is prefilled.
+- **Model names are compared as text.** disensor tells the same model from a
+  distinct one by name, and Cursor's slug for a model need not be the name
+  your reviewer registry gives it. With a reviewer of the generator's own
+  family, `claude-4.5-sonnet` against a registry's `claude-sonnet-4-5` reads
+  as two models. The notice asks to confirm the suggested generator; that is
+  when to make the names agree.
 - **The family table is incomplete on purpose.** Cursor publishes display
   names, not stable model identifiers, so `families.json` is maintained by
   hand and is always behind.
-- **Four vendors have nowhere to go.** disensor's family enum is
-  `anthropic, openai, google, meta, mistral, other`. Grok, Kimi, GLM and
-  Cursor's own Composer models all collapse into `other`, where R4 would read
-  two unrelated vendors as correlated. They are left unmapped instead.
+- **Vendors outside the five named families are `other`.** disensor's family
+  enum is `anthropic, openai, google, meta, mistral, other`. Grok (xAI), Kimi
+  (Moonshot) and GLM (Z.ai) map to `other`, which can only understate
+  independence: against a reviewer of a named family R4 reads another family,
+  which is true, and against another `other` it reads the same family, which
+  is the safe mistake. Cursor's Auto mode and its own Composer models stay
+  unmapped, because the slug does not say what runs underneath: if it were one
+  of the five, `other` would overstate independence. For those, the notice
+  asks the user; the agent is never told to declare itself.
 - **The evidence directory and the configuration** default to disensor's
   (`.residue`, `disensor.config.json`). A repository that moved them has to
   add `--directory` and `--config` to the hook commands, quoted if they hold
@@ -332,9 +368,44 @@ configuration, entering submodules and taking the index lock.
 
 ## Verified against a live Cursor
 
-Run on Windows 11 with version **0.1.0** of this adapter and disensor 0.9.4,
-Cursor with a project-level install, agent mode. The changes since then are
-covered by the test suite and by the contract tests, not yet by a live run.
+### 0.2, on Cursor 3.21.18 (2026-09-24)
+
+Windows 11, disensor 0.10.0, a project-level install from a regular
+`pip install` into its own virtualenv, agent chats with Grok 4.7, in a
+throwaway repository.
+
+- **Cursor sends `composer_mode: chat` for Ask and for the agent alike.** 0.2.0
+  required `agent` and rejected every session. Nothing broke: it said nothing,
+  and `status` showed why (`rejected`, `mode: chat`). The admission by
+  evidence described above is the fix, and everything below ran with it.
+- **The command form holds under Cursor's own launcher.** The quoted
+  interpreter, `-I -c`, the program and the package directory ran for every
+  event.
+- **The full chain works.** `sessionStart` took the session in, the first edit
+  admitted it, and `stop` gave the dirty tree notice. The agent answered that
+  it would not commit on its own and asked whether to leave the changes,
+  discard them or commit them. After the user asked for the commit, `stop`
+  gave the round notice; the agent wrote that the round is the owner's
+  decision, did not run it, and asked to read `disensor guide` instead. One
+  notice per reason and commit: `dirty_tree` at the first head,
+  `round_required` at the new one.
+- **A changed `.cursor/hooks.json` runs without a prompt.** Two entries added
+  mid-session to a project hooks file that was already in use ran on the next
+  event. That is the risk the user-level default exists for.
+- **`model_id` is set now** (`grok-4.7`), next to the legacy `model`.
+- **Every event carries `session_id`**, equal to `conversation_id`, and
+  `sessionStart` fired once per conversation, on its first message: one
+  conversation had four `stop`, two of them from the continuation a notice
+  triggers, and a single `sessionStart`. Between an edit and the `stop` of its
+  turn there were 9 and 46 seconds.
+- **Workspace roots arrive in URI form** on Windows, `/c:/Users/...`. The
+  adapter reads them as paths.
+- **The payload carries `user_email` and `transcript_path`.** The adapter
+  stores neither.
+
+### 0.1.0, on the Cursor of 2026-09-09
+
+Windows 11, disensor 0.9.4, a project-level install, agent mode.
 
 - **The payload arrives with a UTF-8 BOM.** `json.loads` rejects it, so every
   hook silently did nothing until the decode moved to `utf-8-sig`. The hooks
@@ -365,25 +436,22 @@ covered by the test suite and by the contract tests, not yet by a live run.
 
 ## Still to verify
 
-1. The changes after 0.1.0, in a live Cursor: the command form (`-I -c`,
-   with the package directory as an argument), the baseline taken at
-   `sessionStart`, the notice per commit, the coverage witness. `doctor` runs
-   the installed command through cmd.exe, which is as close as the suite
-   gets.
+1. The coverage witness in a live run: a declaration committed after a real
+   round, and the notice staying quiet until a fix makes it stale.
 2. The user-level install end to end. Everything live so far was at project
    level.
-3. Which shell runs the `command` string on Windows. `doctor` runs it through
-   the shell Python gets from the system, cmd.exe on Windows, which is what
-   Node uses for a command line; that Cursor does the same is an assumption.
+3. Which shell runs the `command` string on Windows. The quoted form `init`
+   writes runs under it, which is what matters; `doctor` runs it through
+   cmd.exe, the shell Node uses for a command line.
 4. Whether the `env` returned by `sessionStart` reaches later hooks, given that
    `sessionStart` is documented as fire-and-forget. The adapter does not rely
    on it: the state file is the source of truth.
-5. Whether a `hooks.json` that was already accepted is re-approved when it
-   changes.
-6. `model_id` came back null in every payload seen, with only the legacy
-   `model` slug populated. Whether it is ever set is unknown.
-7. Whether edits made by subagents reach `afterFileEdit` under the parent's
-   conversation. If they do not, their files still count through the baseline.
+5. Whether edits made by subagents reach `afterFileEdit` under the parent's
+   conversation. If they do not, their files still count through the baseline,
+   once some edit has admitted the session.
+6. Whether `stop` can overtake the `afterFileEdit` of its own turn. If it
+   overtook a session's first edit, it would find the session still pending
+   and say nothing until the next turn.
 
 ## Licence
 
