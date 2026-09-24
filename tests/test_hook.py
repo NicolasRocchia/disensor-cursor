@@ -506,14 +506,28 @@ def test_a_known_model_prefills_family_and_model_together(
 
 def test_an_unknown_slug_prefills_nothing(repo, monkeypatch, capsys, stdin_payload, verdict):
     """Guessing a family would make R4 certify a decorrelation that never was.
-    `grok-4.6` is the model that ran in the live test, and it is unmapped."""
+    Cursor's own Composer runs on a model it does not name, so it stays
+    unmapped, and the agent is sent to the user instead of declaring itself."""
     start(repo, monkeypatch, capsys, stdin_payload)
     commit_change(repo, "src/app.py", "x = 2\n")
-    edit(repo, monkeypatch, capsys, stdin_payload, "src/app.py", model="grok-4.6")
+    edit(repo, monkeypatch, capsys, stdin_payload, "src/app.py", model="composer-2.5")
     mensaje = said(stop(repo, monkeypatch, capsys, stdin_payload))
     comando = mensaje.split("The command is incomplete")[0]
     assert "--generator-family" not in comando
     assert "not in the family table" in mensaje
+    assert "Ask the user rather than guessing" in mensaje
+    assert "Declare it yourself" not in mensaje
+
+
+def test_the_model_of_the_live_test_is_declared_other(repo, monkeypatch, capsys, stdin_payload, verdict):
+    """grok-4.7, the model that ran in the live test on Cursor 3.21.18: xAI is
+    none of the five named families."""
+    start(repo, monkeypatch, capsys, stdin_payload)
+    commit_change(repo, "src/app.py", "x = 2\n")
+    edit(repo, monkeypatch, capsys, stdin_payload, "src/app.py", model="grok-4.7")
+    mensaje = said(stop(repo, monkeypatch, capsys, stdin_payload))
+    assert "--generator-family other" in mensaje
+    assert "--generator-model grok-4.7" in mensaje
 
 
 def test_two_models_in_one_session_prefill_nothing(

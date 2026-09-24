@@ -349,7 +349,7 @@ def _generator_suggestion(records: list[dict]) -> tuple[list[str], str]:
         if len(slugs) > 1:
             return [], (
                 "More than one model edited files in this session, so the generator is not "
-                "prefilled. Declare it yourself."
+                "prefilled. Ask the user which one to declare."
             )
         return [], "The generator is not prefilled: no model was observed."
     slug = str(slugs.pop())
@@ -357,7 +357,7 @@ def _generator_suggestion(records: list[dict]) -> tuple[list[str], str]:
     if not flags:
         return [], (
             f"The model reported by Cursor ({_name(slug)}) is not in the family table, so the "
-            "generator is not prefilled. Declare it yourself rather than guessing."
+            "generator is not prefilled. Ask the user rather than guessing."
         )
     return flags, f"Generator suggested from what Cursor reported ({_name(slug)}). Confirm it is right."
 
@@ -510,8 +510,9 @@ def _required_message(
         ]
         if not flags:
             parts += [
-                "The command is incomplete: `--generator-family` and `--generator-model` are "
-                "required and were not prefilled. Ask the user which model wrote this code.",
+                "The command is incomplete: `--generator-family` is required, and "
+                "`--generator-model` has to go with it so disensor can tell the same model from "
+                "a distinct one. Neither was prefilled. Ask the user which model wrote this code.",
                 "",
             ]
         parts += [caveat]

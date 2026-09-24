@@ -14,6 +14,12 @@ from disensor_cursor import families
     ("gemini-3-pro", "google"),
     ("llama-4", "meta"),
     ("mistral-large", "mistral"),
+    # Proveedores que no son ninguno de los cinco con nombre. Grok es el que
+    # corrio en las pruebas en vivo, y Cursor lo lista entre sus modelos.
+    ("grok-4.7", "other"),
+    ("GROK-4.6", "other"),
+    ("kimi-k2", "other"),
+    ("glm-5.2", "other"),
 ])
 def test_known_slugs_map(slug, family):
     assert families.family_of(slug) == family
@@ -21,19 +27,29 @@ def test_known_slugs_map(slug, family):
 
 @pytest.mark.parametrize("slug", [
     "auto",           # Cursor elige: el slug no dice cual corrio
-    "composer-2.5",   # modelos propios de Cursor
-    "grok-4.6",       # xAI no tiene familia propia en el enum
-    "kimi-k2",
-    "glm-5.2",
+    "composer-2.5",   # modelos propios de Cursor, sobre un modelo que no nombra
+    "muse-1",
     "claudette-1",    # el prefijo tiene que terminar en un limite
     "gptx",
+    "grokx-1",
     "",
     None,
 ])
 def test_everything_else_stays_unmapped(slug):
-    """Unmapped is NOT `other`. `other` is a family like any other in the enum,
-    and claiming it would let R4 compare two unrelated vendors as correlated."""
+    """What stays unmapped is a slug whose vendor is not known. `other` would
+    overstate independence if Cursor's Auto or its Composer ran on one of the
+    five named families, so neither is claimed."""
     assert families.family_of(slug) is None
+
+
+def test_a_vendor_outside_the_five_is_other_and_travels_with_its_model():
+    """`other` can only understate independence: against a named family R4
+    reads another family, which is true; against another `other` it reads the
+    same family, which is the safe mistake."""
+    assert families.generator_flags("grok-4.7", None) == [
+        "--generator-family", "other",
+        "--generator-model", "grok-4.7",
+    ]
 
 
 def test_the_flags_come_in_pairs_or_not_at_all():

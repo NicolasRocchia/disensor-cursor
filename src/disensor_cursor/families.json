@@ -1,5 +1,5 @@
 {
-  "note": "Prefix of the model slug Cursor reports, mapped to the model family disensor declares. Cursor does not publish stable slugs: its models page lists display names, so this table is maintained by hand and is deliberately incomplete. A slug that matches nothing here stays UNMAPPED, and unmapped means nothing is prefilled. Inventing a family would make R4 validate a decorrelation that never happened.",
+  "note": "Prefix of the model slug Cursor reports, mapped to the model family disensor declares. Cursor does not publish stable slugs: its models page lists display names, so this table is maintained by hand and is deliberately incomplete. Vendors known to be none of the five named families map to 'other', which can only understate independence. A slug whose vendor is not known, because Cursor picks the model or serves its own, stays UNMAPPED, and unmapped means nothing is prefilled: calling it 'other' would let R4 certify a decorrelation that may not exist.",
   "families": ["anthropic", "openai", "google", "meta", "mistral", "other"],
   "prefixes": {
     "claude": "anthropic",
@@ -11,14 +11,14 @@
     "llama": "meta",
     "mistral": "mistral",
     "codestral": "mistral",
-    "devstral": "mistral"
+    "devstral": "mistral",
+    "grok": "other",
+    "kimi": "other",
+    "glm": "other"
   },
   "deliberately_unmapped": {
     "auto": "Cursor picks the model. The slug does not say which one ran, so the generator cannot be declared.",
-    "composer": "Cursor's own models. They would collapse into 'other', where R4 cannot tell them apart from any other unmapped vendor.",
-    "grok": "xAI has no family of its own in the schema enum. See the residue note in the README.",
-    "kimi": "Moonshot has no family of its own in the schema enum.",
-    "glm": "Z.ai has no family of its own in the schema enum.",
-    "muse": "No family of its own in the schema enum."
+    "composer": "Cursor's own models. What they are built on is not published: if it were one of the five named families, 'other' would overstate independence.",
+    "muse": "The vendor is not known."
   }
 }

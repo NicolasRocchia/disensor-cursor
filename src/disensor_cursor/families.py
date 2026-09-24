@@ -4,10 +4,14 @@ Cursor does not publish stable model identifiers: its models page lists display
 names. Whatever mapping lives here is maintained by hand against a third
 party's release calendar, so the only safe default is to map nothing.
 
-An unmapped slug does NOT mean `other`. `other` is a family like any other in
-disensor's enum, and claiming it would let R4 compare two vendors that share
-nothing as if they were correlated, or decorrelated. Unmapped means the
-generator is not prefilled and the agent declares it.
+`other` is claimed only for vendors known to be none of the five named
+families: xAI's Grok, Moonshot's Kimi, Z.ai's GLM. That can only understate
+independence. Against a reviewer of a named family R4 reads another family,
+which is true; against another `other` it reads the same family, which is the
+safe mistake. A slug whose vendor is not known, Cursor's Auto or its own
+Composer, stays unmapped: if it runs on one of the five, `other` would
+overstate independence. Unmapped means the generator is not prefilled and the
+user is asked.
 """
 from __future__ import annotations
 
