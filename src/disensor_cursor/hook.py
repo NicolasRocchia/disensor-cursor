@@ -99,6 +99,22 @@ def _emit(result: dict) -> None:
         pass
 
 
+_URI_DRIVE = re.compile(r"^/[A-Za-z]:[\\/]")
+
+
+def _local(raw: str) -> str:
+    """A workspace root as Windows reads it.
+
+    Cursor 3.21 sends them in URI form on Windows, `/c:/Users/...`, seen live.
+    With the leading slash, that is not a path Windows resolves. Anywhere else
+    the same text is an absolute path, and dropping the slash would make it
+    relative to wherever the hook runs.
+    """
+    if sys.platform == "win32" and _URI_DRIVE.match(raw):
+        return raw[1:]
+    return raw
+
+
 def _worktree(payload: dict) -> Path | None:
     """The project this hook is talking about.
 
@@ -114,7 +130,7 @@ def _worktree(payload: dict) -> Path | None:
     `git.exe` from a PATH entry inside that same project.
     """
     roots = payload.get("workspace_roots")
-    roots = [r for r in roots if isinstance(r, str) and r] if isinstance(roots, list) else []
+    roots = [_local(r) for r in roots if isinstance(r, str) and r] if isinstance(roots, list) else []
     candidate = (
         os.environ.get("CURSOR_PROJECT_DIR")
         or os.environ.get("CLAUDE_PROJECT_DIR")

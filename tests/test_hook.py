@@ -736,3 +736,43 @@ def test_the_notice_is_marked_only_after_it_is_emitted(
     )
     commit()
     assert state.already_reported(key, notice)
+
+
+def test_a_workspace_root_in_uri_form_is_read(repo, monkeypatch):
+    """Cursor 3.21 sends workspace roots as `/c:/Users/...` on Windows, seen
+    live. With the leading slash Windows resolves nothing, and without
+    CURSOR_PROJECT_DIR that was the only way to the project."""
+    import sys as system
+
+    if system.platform != "win32":
+        pytest.skip("drive letters are a Windows thing")
+    monkeypatch.delenv("CURSOR_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    uri = "/" + str(repo.resolve()).replace("\\", "/")
+    uri = uri[:2].lower() + uri[2:]
+    found = hook._worktree({"workspace_roots": [uri]})
+    assert found is not None and found.resolve() == repo.resolve()
+
+
+@pytest.mark.parametrize("platform, expected", [
+    ("win32", "c:/Users/proyecto"),
+    ("linux", "/c:/Users/proyecto"),
+    ("darwin", "/c:/Users/proyecto"),
+])
+def test_the_uri_form_is_read_as_such_only_on_windows(monkeypatch, platform, expected):
+    """Anywhere but Windows, `/c:/...` is already an absolute path, and
+    dropping its slash made it relative to wherever the hook runs."""
+    monkeypatch.setattr(hook.sys, "platform", platform)
+    assert hook._local("/c:/Users/proyecto") == expected
+
+
+@pytest.mark.parametrize("raw", [
+    "//servidor/recurso/proyecto",
+    "\\\\servidor\\recurso\\proyecto",
+    "/home/nico/proyecto",
+    "/c:",
+    "c:/Users/proyecto",
+])
+def test_every_other_root_is_left_as_it_came(monkeypatch, raw):
+    monkeypatch.setattr(hook.sys, "platform", "win32")
+    assert hook._local(raw) == raw
