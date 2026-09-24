@@ -38,18 +38,20 @@ def start(repo, monkeypatch, capsys, stdin_payload, *, mode="agent", background=
 
 
 def stop(repo, monkeypatch, capsys, stdin_payload, *, status="completed", conversation="conv-1",
-         **flags):
+         session="ses-1", **flags):
     return run("stop", {
         "conversation_id": conversation,
+        "session_id": session,
         "status": status,
         "loop_count": 0,
     }, repo, monkeypatch, capsys, stdin_payload, **flags)
 
 
 def edit(repo, monkeypatch, capsys, stdin_payload, relative, *, conversation="conv-1",
-         model="claude-4.5-sonnet"):
+         session="ses-1", model="claude-4.5-sonnet"):
     return run("afterFileEdit", {
         "conversation_id": conversation,
+        "session_id": session,
         "file_path": str(repo / relative),
         "model": model,
         "edits": [{"old_string": "SECRETO", "new_string": "OTRO SECRETO"}],
@@ -64,7 +66,7 @@ def working(repo, monkeypatch, capsys, stdin_payload, *, relative="src/app.py", 
     """
     start(repo, monkeypatch, capsys, stdin_payload, **kw)
     edit(repo, monkeypatch, capsys, stdin_payload, relative,
-         conversation=kw.get("conversation", "conv-1"))
+         conversation=kw.get("conversation", "conv-1"), session=kw.get("session", "ses-1"))
 
 
 def commit_change(repo: Path, relative: str, content: str) -> str:
@@ -484,9 +486,9 @@ def test_a_new_session_in_the_same_conversation_starts_over(
     start(repo, monkeypatch, capsys, stdin_payload, session="ses-2")
     assert state.eligibility(state.session_key("conv-1", str(repo))) == state.PENDING, \
         "a new session has to prove itself again"
-    edit(repo, monkeypatch, capsys, stdin_payload, "src/app.py")
+    edit(repo, monkeypatch, capsys, stdin_payload, "src/app.py", session="ses-2")
     commit_change(repo, "src/app.py", "x = 3\n")
-    assert said(stop(repo, monkeypatch, capsys, stdin_payload))
+    assert said(stop(repo, monkeypatch, capsys, stdin_payload, session="ses-2"))
 
 
 # --- prellenado del generador ---------------------------------------------
@@ -547,7 +549,7 @@ def test_the_edit_log_keeps_metadata_and_never_the_code(repo, monkeypatch, capsy
     assert b"\r\n" not in crudo, "the log is ours: no line-ending translation"
     registro = state.read_edits(key)[0]
     assert registro["path"] == "src/app.py"
-    assert set(registro) == {"ts", "path", "model", "model_id"}
+    assert set(registro) == {"ts", "path", "model", "model_id", "session_id"}
 
 
 # --- lo que agrego la primera ronda de Codex ------------------------------
@@ -564,8 +566,8 @@ def test_a_new_session_does_not_inherit_the_edits_of_the_previous_one(
     edit(repo, monkeypatch, capsys, stdin_payload, "src/app.py", model="gpt-5.4")
     assert said(stop(repo, monkeypatch, capsys, stdin_payload))
     start(repo, monkeypatch, capsys, stdin_payload, session="ses-2")
-    edit(repo, monkeypatch, capsys, stdin_payload, "notas.md")
-    assert stop(repo, monkeypatch, capsys, stdin_payload) == {}
+    edit(repo, monkeypatch, capsys, stdin_payload, "notas.md", session="ses-2")
+    assert stop(repo, monkeypatch, capsys, stdin_payload, session="ses-2") == {}
     registros = state.read_edits(state.session_key("conv-1", str(repo)))
     assert [r["path"] for r in registros] == ["notas.md"]
 
@@ -739,6 +741,92 @@ def test_a_late_edit_does_not_undo_a_rejection(repo, monkeypatch, capsys, stdin_
     edit(repo, monkeypatch, capsys, stdin_payload, "src/app.py")
     assert state.eligibility(key) == state.REJECTED
     assert state.read_state(key)["is_background_agent"] is True
+
+
+def test_a_late_edit_of_the_previous_session_does_not_admit_the_next(
+    repo, monkeypatch, capsys, stdin_payload
+):
+    """The edit read the state while it was still the previous session's, and
+    the next session started before the edit admitted. The admission is
+    decided under the lock, against the session the edit belongs to, and its
+    record is left out of the next session's."""
+    key = state.session_key("conv-1", str(repo))
+    start(repo, monkeypatch, capsys, stdin_payload)
+    original = state.append_edit
+
+    def meanwhile(llave, record):
+        monkeypatch.setattr(state, "append_edit", original)
+        hook._session_start({"conversation_id": "conv-1", "session_id": "ses-2",
+                             "composer_mode": "agent", "is_background_agent": False}, {})
+        return original(llave, record)
+
+    monkeypatch.setattr(state, "append_edit", meanwhile)
+    edit(repo, monkeypatch, capsys, stdin_payload, "src/app.py")
+    assert state.read_state(key)["session_id"] == "ses-2"
+    assert state.eligibility(key) == state.PENDING
+    assert state.read_edits(key, "ses-2") == []
+
+
+def test_a_record_of_another_session_does_not_count_for_this_one(
+    repo, monkeypatch, capsys, stdin_payload, verdict
+):
+    """What the test above leaves in the log. Counted, it told the next session
+    about work it never did and mixed a model it never ran into its generator."""
+    key = state.session_key("conv-1", str(repo))
+    start(repo, monkeypatch, capsys, stdin_payload, session="ses-2")
+    state.append_edit(key, {"path": "src/app.py", "model": "gpt-5.4", "session_id": "ses-1"})
+    commit_change(repo, "src/app.py", "x = 2\n")
+    edit(repo, monkeypatch, capsys, stdin_payload, "src/app.py", session="ses-2")
+    mensaje = said(stop(repo, monkeypatch, capsys, stdin_payload, session="ses-2"))
+    assert "--generator-family anthropic" in mensaje
+
+
+def test_an_edit_of_another_session_is_not_recorded(repo, monkeypatch, capsys, stdin_payload):
+    """The key is the conversation and the checkout, not the session: without
+    comparing sessions, a late edit of the previous one admitted the next."""
+    key = state.session_key("conv-1", str(repo))
+    start(repo, monkeypatch, capsys, stdin_payload, session="ses-1")
+    start(repo, monkeypatch, capsys, stdin_payload, session="ses-2")
+    edit(repo, monkeypatch, capsys, stdin_payload, "src/app.py", session="ses-1")
+    assert state.eligibility(key) == state.PENDING
+    assert state.read_edits(key) == []
+
+
+def test_a_stop_of_another_session_says_nothing(repo, monkeypatch, capsys, stdin_payload, verdict):
+    """A stop that arrives before its own sessionStart landed read the state of
+    the previous session, and gave a notice about that session's work."""
+    working(repo, monkeypatch, capsys, stdin_payload)
+    commit_change(repo, "src/app.py", "x = 2\n")
+    assert stop(repo, monkeypatch, capsys, stdin_payload, session="ses-2") == {}
+    assert said(stop(repo, monkeypatch, capsys, stdin_payload)), "its own session's stop does speak"
+
+
+def test_the_mark_of_an_old_notice_does_not_spend_the_next_sessions(
+    repo, monkeypatch, capsys, stdin_payload, verdict
+):
+    """The mark runs once stdout is flushed. A session that started in between
+    had its own notice, same reason and head, spent by the old one's mark."""
+    working(repo, monkeypatch, capsys, stdin_payload)
+    commit_change(repo, "src/app.py", "x = 2\n")
+    monkeypatch.setenv("CURSOR_PROJECT_DIR", str(repo))
+    resultado, marca = hook._stop(
+        {"conversation_id": "conv-1", "session_id": "ses-1", "status": "completed"}, {})
+    assert "followup_message" in resultado
+    start(repo, monkeypatch, capsys, stdin_payload, session="ses-2")
+    edit(repo, monkeypatch, capsys, stdin_payload, "src/app.py", session="ses-2")
+    marca()
+    assert said(stop(repo, monkeypatch, capsys, stdin_payload, session="ses-2"))
+
+
+def test_an_event_without_a_session_id_is_judged_as_before(
+    repo, monkeypatch, capsys, stdin_payload, verdict
+):
+    """Cursor 3.21 sends session_id with every event, seen live. An event that
+    comes without one is not dropped: only a known mismatch excludes."""
+    start(repo, monkeypatch, capsys, stdin_payload)
+    commit_change(repo, "src/app.py", "x = 2\n")
+    edit(repo, monkeypatch, capsys, stdin_payload, "src/app.py", session=None)
+    assert said(stop(repo, monkeypatch, capsys, stdin_payload, session=None))
 
 
 # --- robustez -------------------------------------------------------------

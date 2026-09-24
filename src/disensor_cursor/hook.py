@@ -273,8 +273,14 @@ def _after_file_edit(payload: dict, options: dict) -> tuple[dict, object]:
     if repo is None:
         return {}, None
     key = state.session_key(payload.get("conversation_id", ""), str(repo))
-    eligibility = state.eligibility(key)
+    session = state.read_state(key)
+    eligibility = session.get("eligibility")
     if eligibility not in (state.PENDING, state.ADMITTED):
+        return {}, None
+    session_id = payload.get("session_id")
+    # Una edicion de la sesion anterior de la conversacion, que llega tarde, no
+    # es evidencia de esta: sin el cotejo admitia una sesion que no edito nada.
+    if not state.belongs(session.get("session_id"), session_id):
         return {}, None
     relative = _relative(str(payload.get("file_path") or ""), repo)
     if not relative:
@@ -287,14 +293,15 @@ def _after_file_edit(payload: dict, options: dict) -> tuple[dict, object]:
         "path": relative,
         "model": payload.get("model"),
         "model_id": payload.get("model_id"),
+        "session_id": session_id,
     })
     if eligibility == state.PENDING:
         # La evidencia: el agente edito un archivo de este repositorio. Es lo
         # unico que distingue ya una conversacion que cambia codigo de una de
         # Ask, porque Cursor manda el mismo composer_mode para las dos. Se
-        # admite bajo el lock y solo si sigue pendiente: si mientras tanto la
-        # rechazaron, queda como esta.
-        state.admit(key)
+        # admite bajo el lock y solo si sigue pendiente y es la misma sesion:
+        # si mientras tanto la rechazaron o empezo otra, queda como esta.
+        state.admit(key, session_id)
     return {}, None
 
 
@@ -533,8 +540,13 @@ def _stop(payload: dict, options: dict) -> tuple[dict, object]:
         return {}, None
     key = state.session_key(payload.get("conversation_id", ""), str(repo))
     session = state.read_state(key)
-    if state.eligibility(key) != state.ADMITTED:
+    if session.get("eligibility") != state.ADMITTED:
         return {}, None
+    # Un stop de otra sesion de la conversacion, llegado antes que su propio
+    # sessionStart, leia el estado de la anterior y avisaba con su trabajo.
+    if not state.belongs(session.get("session_id"), payload.get("session_id")):
+        return {}, None
+    owner = session.get("session_id") or payload.get("session_id")
     if not _adopted(repo, _config(options)):
         return {}, None
 
@@ -547,7 +559,7 @@ def _stop(payload: dict, options: dict) -> tuple[dict, object]:
         state.note(f"{repo}: HEAD does not resolve (a repository without commits?)")
         return {}, None
 
-    records = state.read_edits(key)
+    records = state.read_edits(key, owner)
     touched = _touched(session, records, repo, head, dirty)
     # Una sesion que no cambio nada no tiene nada propio que cerrar. Ademas
     # hace que `stop` sea casi gratis en las sesiones de solo lectura: ni git
@@ -557,7 +569,7 @@ def _stop(payload: dict, options: dict) -> tuple[dict, object]:
 
     mine = dirty & touched
     if mine:
-        return _notice(key, state.DIRTY_TREE, head, _dirty_message(mine))
+        return _notice(key, state.DIRTY_TREE, head, _dirty_message(mine), owner)
 
     base_ref = options.get("base") or gitio.default_base(repo)
     if not base_ref:
@@ -586,7 +598,7 @@ def _stop(payload: dict, options: dict) -> tuple[dict, object]:
         state.note(f"{repo}: could not ask disensor ({check.detail})")
         return {}, None
     if check.verdict == disensor.BLOCKED:
-        return _notice(key, state.BLOCKED, head, _blocked_message(check.detail))
+        return _notice(key, state.BLOCKED, head, _blocked_message(check.detail), owner)
 
     # El rango como lo mide el gate: desde el merge base y no desde la punta
     # del destino. Medido desde la punta, un cambio que el destino tambien hizo
@@ -613,21 +625,24 @@ def _stop(payload: dict, options: dict) -> tuple[dict, object]:
         config=options.get("config"),
         directory=options.get("directory"),
     )
-    return _notice(key, state.ROUND_REQUIRED, head, message)
+    return _notice(key, state.ROUND_REQUIRED, head, message, owner)
 
 
-def _notice(key: str, reason: str, head: str, message: str) -> tuple[dict, object]:
+def _notice(
+    key: str, reason: str, head: str, message: str, session_id: str | None = None,
+) -> tuple[dict, object]:
     """One notice per reason and head, marked only after it is sent.
 
     Marking before emitting would let a process killed in between burn a
     notice nobody read, so the mark is a callback the caller runs after stdout
     is flushed. The failure mode becomes a repeated notice, which is the
-    harmless one.
+    harmless one. The mark goes to the session the notice was worked out for,
+    and to no other that started in between.
     """
     notice = state.token(reason, head)
     if state.already_reported(key, notice):
         return {}, None
-    return {"followup_message": message}, lambda: state.mark_reported(key, notice)
+    return {"followup_message": message}, lambda: state.mark_reported(key, notice, session_id)
 
 
 HANDLERS = {

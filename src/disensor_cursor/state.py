@@ -18,7 +18,8 @@ reads counter=0, the stop hook saves counter=1, the edit hook saves its stale
 copy back. So the edit log is append-only, and the state file is written only
 under the lock, deciding inside it on what the file holds then: by
 sessionStart, by the one afterFileEdit that admits a pending session, and by
-the mark a notice leaves once it went out.
+the mark a notice leaves once it went out. Each of them acts only on the
+session its event came from.
 """
 from __future__ import annotations
 
@@ -286,11 +287,23 @@ def update_state(key: str, changes: dict) -> dict:
     return modify_state(key, lambda data: changes)
 
 
-def admit(key: str) -> None:
-    """Pending to admitted, if the state is still pending. A rejection found
-    under the lock stays."""
+def belongs(recorded: str | None, session_id: str | None) -> bool:
+    """Whether what was recorded for session `recorded` counts for `session_id`.
+
+    The key is the conversation and the checkout, not the session, so a late
+    edit or `stop` of the previous session of a conversation lands on the
+    state of the next one. Only a known mismatch excludes: Cursor 3.21 sends
+    the same session_id with every event, seen live, and an event or a record
+    without one is judged as before rather than dropped.
+    """
+    return not (recorded and session_id and recorded != session_id)
+
+
+def admit(key: str, session_id: str | None) -> None:
+    """Pending to admitted, if the state is still the pending session the edit
+    belongs to. A rejection or a newer session found under the lock stays."""
     def decide(data: dict) -> dict | None:
-        if data.get("eligibility") != PENDING:
+        if data.get("eligibility") != PENDING or not belongs(data.get("session_id"), session_id):
             return None
         return {"eligibility": ADMITTED, "admitted_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
 
@@ -306,13 +319,19 @@ def already_reported(key: str, notice: str) -> bool:
     return notice in set(read_state(key).get("reported", []))
 
 
-def mark_reported(key: str, notice: str) -> None:
-    with _Lock(state_path(key)):
-        data = read_state(key)
-        reported = set(data.get("reported", []))
-        reported.add(notice)
-        data["reported"] = sorted(reported)
-        write_state(key, data)
+def mark_reported(key: str, notice: str, session_id: str | None = None) -> None:
+    """Remember a notice on the session it was worked out for.
+
+    The mark runs once stdout is flushed, and a new session may have started
+    in between: marking the new one would spend its own notice with the old
+    one's.
+    """
+    def decide(data: dict) -> dict | None:
+        if not belongs(data.get("session_id"), session_id):
+            return None
+        return {"reported": sorted(set(data.get("reported") or []) | {notice})}
+
+    modify_state(key, decide)
 
 
 def append_edit(key: str, record: dict) -> None:
@@ -335,12 +354,16 @@ def append_edit(key: str, record: dict) -> None:
         handle.write(line)
 
 
-def read_edits(key: str) -> list[dict]:
+def read_edits(key: str, session_id: str | None = None) -> list[dict]:
     """Every edit this session recorded, oldest first.
 
     A truncated or half-written line is skipped rather than fatal: the file is
     append-only from a process that can be killed at any moment, and losing one
     record degrades towards staying quiet, which is the safe direction.
+
+    With `session_id`, an edit recorded for another session is left out. One
+    can slip in after sessionStart cleared the log: its hook read the state
+    before the new session was written.
     """
     path = edits_path(key)
     if not path.exists():
@@ -356,7 +379,7 @@ def read_edits(key: str) -> list[dict]:
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(record, dict):
+                if isinstance(record, dict) and belongs(record.get("session_id"), session_id):
                     records.append(record)
     except OSError:
         return records
