@@ -15,8 +15,10 @@ reserved names, alternate data streams.
 Edits and verdicts go to different files. `afterFileEdit` and `stop` run as
 separate processes and a shared read-modify-write loses updates: the edit hook
 reads counter=0, the stop hook saves counter=1, the edit hook saves its stale
-copy back. Splitting by writer removes the race without a lock; the lock is
-only for two `stop` hooks racing each other.
+copy back. So the edit log is append-only, and the state file is written only
+under the lock, deciding inside it on what the file holds then: by
+sessionStart, by the one afterFileEdit that admits a pending session, and by
+the mark a notice leaves once it went out.
 """
 from __future__ import annotations
 
@@ -31,10 +33,13 @@ from . import clock
 
 STATE_DIR = Path.home() / ".disensor-cursor"
 
-# Elegibilidad ternaria y no un booleano: un booleano no sabe revocar. Una
-# sesion reanudada, o una que cambia de modo sin otro sessionStart, arrastraria
-# un permiso viejo. `unknown` es el default y no engancha.
+# Elegibilidad con estados y no un booleano: un booleano no sabe revocar, ni
+# esperar. `pending` es una sesion que sessionStart tomo, en un repositorio
+# adoptado y fuera de un agente en segundo plano, y que todavia no edito nada;
+# la primera edicion del agente la pasa a `admitted`, y solo esa recibe avisos.
+# `unknown`, sin sessionStart, es el default y nunca engancha.
 ADMITTED = "admitted"
+PENDING = "pending"
 REJECTED = "rejected"
 UNKNOWN = "unknown"
 
@@ -138,8 +143,12 @@ class _Lock:
 
     It can never be what stalls the agent: the wait comes out of the run's
     budget, a lock left behind by a dead process is reclaimed, and past the
-    wait the caller proceeds anyway. Losing a race means at worst a repeated
-    reminder, which is the benign failure; blocking Cursor is not.
+    wait the caller proceeds anyway. So a writer that stalls while holding it,
+    for longer than the other one waits, can still cross decisions with the
+    one that went ahead: a mark lost, which repeats a notice; an admission
+    lost, which waits for the session's next edit; or, when the stalled writer
+    is the admission, a rejection written over. Blocking Cursor would be worse
+    than any of them.
     """
 
     def __init__(self, target: Path) -> None:
@@ -253,18 +262,44 @@ def write_state(key: str, data: dict) -> None:
     replace_file(temporary, path)
 
 
-def update_state(key: str, changes: dict) -> dict:
-    """Read, merge and write under the lock. For the writers that race."""
+def modify_state(key: str, decide) -> dict:
+    """Read, decide and write under one lock.
+
+    For a change that depends on what is already there. Deciding on a copy
+    read before the lock let a slower writer put back a state that another one
+    had already moved on: a resume undid the admission an edit had just made,
+    and a late edit admitted a session that sessionStart had just rejected.
+    `decide` gets the current state and returns the changes, or nothing to
+    leave it as it is.
+    """
     with _Lock(state_path(key)):
         data = read_state(key)
-        data.update(changes)
-        write_state(key, data)
+        changes = decide(dict(data))
+        if changes:
+            data.update(changes)
+            write_state(key, data)
         return data
+
+
+def update_state(key: str, changes: dict) -> dict:
+    """Merge `changes` under the lock, whatever the state holds."""
+    return modify_state(key, lambda data: changes)
+
+
+def admit(key: str) -> None:
+    """Pending to admitted, if the state is still pending. A rejection found
+    under the lock stays."""
+    def decide(data: dict) -> dict | None:
+        if data.get("eligibility") != PENDING:
+            return None
+        return {"eligibility": ADMITTED, "admitted_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+    modify_state(key, decide)
 
 
 def eligibility(key: str) -> str:
     value = read_state(key).get("eligibility")
-    return value if value in (ADMITTED, REJECTED) else UNKNOWN
+    return value if value in (ADMITTED, PENDING, REJECTED) else UNKNOWN
 
 
 def already_reported(key: str, notice: str) -> bool:

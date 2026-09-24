@@ -182,37 +182,25 @@ def _session_start(payload: dict, options: dict) -> tuple[dict, object]:
         return {}, None
     key = state.session_key(payload.get("conversation_id", ""), str(repo))
 
-    eligible = (
-        payload.get("composer_mode") == "agent"
-        and not payload.get("is_background_agent")
-        and _adopted(repo, _config(options))
-    )
-    existing = state.read_state(key)
+    # `composer_mode` no decide. Cursor 3.21 manda `chat` tanto en Ask como en
+    # modo agente (visto en vivo) y su documentacion sigue diciendo agent, ask
+    # y edit; exigir `agent` dejaba al adaptador mudo. La sesion queda
+    # pendiente, y la admite la primera edicion del agente (ver
+    # _after_file_edit): una conversacion de Ask nunca edita. El costo es que
+    # una sesion que cambia codigo solo por terminal nunca queda admitida.
+    eligible = not payload.get("is_background_agent") and _adopted(repo, _config(options))
     session_id = payload.get("session_id")
-    # Una conversacion reanudada con la misma sesion conserva lo que ya se
-    # aviso y su linea de base. Pisarlos repetia los avisos y, peor, tomaba
-    # como punto de partida un arbol que la propia sesion ya habia tocado.
+    # Esta lectura solo decide si hace falta una linea de base y si se borran
+    # las ediciones de otra sesion. La elegibilidad se decide abajo, bajo el
+    # lock y con lo que haya entonces.
+    existing = state.read_state(key)
     same_session = bool(session_id) and existing.get("session_id") == session_id
-
-    changes: dict = {
-        "eligibility": state.ADMITTED if eligible else state.REJECTED,
-        "worktree": str(repo),
-        "composer_mode": payload.get("composer_mode"),
-        "is_background_agent": bool(payload.get("is_background_agent")),
-        "adapter_version": __version__,
-    }
     if not same_session:
-        changes.update({
-            "session_id": session_id,
-            "opened_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "reported": [],
-            "head_at_start": None,
-            "dirty_at_start": None,
-        })
         # Una sesion nueva no hereda las ediciones de la anterior: se le
         # avisaba por trabajo que no hizo y se le prellenaba el generador con
         # modelos que no corrio.
         state.clear_edits(key)
+    baseline: dict = {}
     needs_baseline = eligible and (not same_session or "head_at_start" not in existing)
     if needs_baseline:
         # La linea de base es lo que permite atribuirle a la sesion lo que
@@ -222,16 +210,51 @@ def _session_start(payload: dict, options: dict) -> tuple[dict, object]:
         # llamadas a git no se sienten.
         #
         # Si git no llega a tiempo, en un repositorio enorme por ejemplo, la
-        # sesion se admite igual con la base desconocida. Sin esto la
-        # excepcion cortaba antes de guardar la admision y el adaptador
-        # quedaba inactivo en ese repositorio sin decir por que.
+        # sesion se toma igual con la base desconocida. Sin esto la excepcion
+        # cortaba antes de guardar la sesion y el adaptador quedaba inactivo en
+        # ese repositorio sin decir por que.
         try:
             dirty = gitio.dirty_paths(repo)
-            changes["head_at_start"] = gitio.rev_parse("HEAD", repo)
-            changes["dirty_at_start"] = sorted(dirty) if dirty is not None else None
+            baseline = {
+                "head_at_start": gitio.rev_parse("HEAD", repo),
+                "dirty_at_start": sorted(dirty) if dirty is not None else None,
+            }
         except gitio.GitUnavailable as exc:
-            state.note(f"{repo}: session admitted without a baseline ({exc})")
-    state.update_state(key, changes)
+            state.note(f"{repo}: session taken in without a baseline ({exc})")
+
+    def take_in(current: dict) -> dict:
+        # Una conversacion reanudada con la misma sesion conserva lo que ya se
+        # aviso, su linea de base y su admision. Pisarlos repetia los avisos y,
+        # peor, tomaba como punto de partida un arbol que la propia sesion ya
+        # habia tocado. Se mira lo que hay bajo el lock y no la lectura de
+        # arriba: entre las dos corrio git, y la primera edicion pudo admitir
+        # esta misma sesion; decidir con la copia vieja le borraba la admision.
+        same = bool(session_id) and current.get("session_id") == session_id
+        if not eligible:
+            eligibility = state.REJECTED
+        elif same and current.get("eligibility") == state.ADMITTED:
+            eligibility = state.ADMITTED
+        else:
+            eligibility = state.PENDING
+        changes: dict = {
+            "eligibility": eligibility,
+            "worktree": str(repo),
+            "composer_mode": payload.get("composer_mode"),
+            "is_background_agent": bool(payload.get("is_background_agent")),
+            "adapter_version": __version__,
+        }
+        if not same:
+            changes.update({
+                "session_id": session_id,
+                "opened_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "reported": [],
+                "head_at_start": None,
+                "dirty_at_start": None,
+            })
+        changes.update(baseline)
+        return changes
+
+    state.modify_state(key, take_in)
 
     if not eligible:
         return {}, None
@@ -250,7 +273,8 @@ def _after_file_edit(payload: dict, options: dict) -> tuple[dict, object]:
     if repo is None:
         return {}, None
     key = state.session_key(payload.get("conversation_id", ""), str(repo))
-    if state.eligibility(key) != state.ADMITTED:
+    eligibility = state.eligibility(key)
+    if eligibility not in (state.PENDING, state.ADMITTED):
         return {}, None
     relative = _relative(str(payload.get("file_path") or ""), repo)
     if not relative:
@@ -264,6 +288,13 @@ def _after_file_edit(payload: dict, options: dict) -> tuple[dict, object]:
         "model": payload.get("model"),
         "model_id": payload.get("model_id"),
     })
+    if eligibility == state.PENDING:
+        # La evidencia: el agente edito un archivo de este repositorio. Es lo
+        # unico que distingue ya una conversacion que cambia codigo de una de
+        # Ask, porque Cursor manda el mismo composer_mode para las dos. Se
+        # admite bajo el lock y solo si sigue pendiente: si mientras tanto la
+        # rechazaron, queda como esta.
+        state.admit(key)
     return {}, None
 
 
