@@ -158,12 +158,21 @@ def safe_path_entries(exclude=()) -> list[str]:
 
 
 def find(name: str, exclude=()) -> str | None:
-    """Absolute path of `name` on the safe part of PATH, or None."""
+    """Absolute path of `name` on the safe part of PATH, or None.
+
+    The file itself is judged too, not only its directory: a link in a PATH
+    entry outside the project can point at a program inside it, and what runs
+    is the target.
+    """
+    roots = _project_roots() + [r for r in map(_resolved, exclude) if r is not None]
     for directory in safe_path_entries(exclude):
         for extension in _extensions(name):
             candidate = os.path.join(directory, name + extension)
-            if os.path.isfile(candidate) and (sys.platform == "win32" or os.access(candidate, os.X_OK)):
-                return os.path.abspath(candidate)
+            if not os.path.isfile(candidate) or not (sys.platform == "win32" or os.access(candidate, os.X_OK)):
+                continue
+            if _points_inside(os.path.realpath(candidate), roots):
+                continue
+            return os.path.abspath(candidate)
     return None
 
 

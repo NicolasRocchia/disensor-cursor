@@ -211,6 +211,35 @@ def test_a_python_location_that_points_into_the_repository_is_not_inherited(tmp_
         assert (variable in {k.upper() for k in env}) is kept, value
 
 
+def test_a_link_outside_the_project_to_a_program_inside_it_is_not_found(tmp_path, monkeypatch):
+    """Codex, second round on doctor: find judged the PATH entry and not the
+    file, so a link in an entry outside the project that points at a program
+    inside it was taken. What runs is the target. The hook finds git and
+    disensor this way."""
+    import sys
+
+    nombre = "herramienta.exe" if sys.platform == "win32" else "herramienta"
+    proyecto = tmp_path / "proyecto"
+    proyecto.mkdir()
+    afuera = tmp_path / "afuera"
+    afuera.mkdir()
+    en_bin = tmp_path / "bin"
+    en_bin.mkdir()
+    for destino in (proyecto / nombre, afuera / nombre):
+        destino.write_bytes(b"")
+        destino.chmod(0o755)
+    try:
+        (en_bin / nombre).symlink_to(proyecto / nombre)
+    except OSError:
+        pytest.skip("this machine does not let the test create a link")
+    monkeypatch.setenv("CURSOR_PROJECT_DIR", str(proyecto))
+    monkeypatch.setenv("PATH", str(en_bin))
+    assert executables.find("herramienta") is None
+    (en_bin / nombre).unlink()
+    (en_bin / nombre).symlink_to(afuera / nombre)
+    assert executables.find("herramienta") == str(en_bin / nombre), "a link to a program outside is fine"
+
+
 def test_children_never_fetch_from_the_network():
     """A lazy fetch runs the transport the repository's config names."""
     assert executables.child_environment()["GIT_NO_LAZY_FETCH"] == "1"
