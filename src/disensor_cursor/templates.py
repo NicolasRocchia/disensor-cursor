@@ -35,8 +35,13 @@ PROGRAM = (
 )
 
 # Lo que algun shell expande incluso entre comillas dobles: `%` y `!` en
-# cmd.exe, `$` y el backtick en sh y en PowerShell. La comilla doble cierra.
-_EXPANDED = frozenset('"%!$`')
+# cmd.exe, `$` y el backtick en sh y en PowerShell. La comilla doble cierra, y
+# PowerShell, que es la shell con que Cursor corre los hooks en Windows, cierra
+# una cadena entre comillas dobles tambien con las dobles tipograficas: una
+# ruta con una de esas la cortaba. Las simples tipograficas no cierran una
+# cadena doble, y rechazarlas dejaba afuera rutas validas como `O'Brien` con
+# su apostrofo curvo.
+_EXPANDED = frozenset('"%!$`' "\u201c\u201d\u201e")
 
 # Lo que puede ir sin comillas y significa lo mismo en cmd.exe y en sh. Ni `,`
 # ni `=`: cmd.exe los trata como separadores en algunos lugares, y sh lee un

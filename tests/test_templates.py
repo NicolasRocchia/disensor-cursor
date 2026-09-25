@@ -152,6 +152,19 @@ def test_only_objects_can_be_ours():
     assert not templates.is_ours(None)
 
 
+def test_a_typographic_apostrophe_goes_through_and_stays_ours():
+    """Codex, fourth round on doctor: the single typographic quotes do not
+    close a double-quoted string in PowerShell, and refusing them left out a
+    user folder like O'Brien with its curly apostrophe, and stopped init and
+    uninstall from recognising a hook already installed there."""
+    python = "C:\\Users\\O\u2019Brien\\python.exe"
+    command = templates.command_for("stop", python, "", None)
+    assert templates._tokens(command)[0] == python
+    old = templates.hooks_config(python, "", None, location=r"C:\viejo\site-packages")
+    new = templates.hooks_config(python, "", None, location=r"C:\nuevo\site-packages")
+    assert templates.merge_hooks(old, new)["hooks"]["stop"] == new["hooks"]["stop"]
+
+
 def test_a_moved_package_is_still_recognised_so_init_replaces_it():
     """Reinstalling in another place changes the location in the command; the
     old entry has to be recognised or init would leave both."""
@@ -187,6 +200,11 @@ def test_paths_are_always_quoted():
     # Codex, quinta ronda: sh convierte `\\` en `\` entre comillas dobles.
     "\\\\servidor\\python\\python.exe",
     "C:\\a\\\\b\\python.exe",
+    # Codex, tercera ronda sobre doctor: PowerShell tambien cierra una cadena
+    # doble en las comillas dobles tipograficas, y el parser de Windows
+    # PowerShell 5.1 rechazaba el comando que init escribia con una de estas.
+    "C:\\\u201ccitas\u201d\\python.exe",
+    "C:\\baja\u201e\\python.exe",
 ])
 def test_a_path_some_shell_would_rewrite_is_refused(path):
     with pytest.raises(ValueError, match="cannot go into a command line"):
