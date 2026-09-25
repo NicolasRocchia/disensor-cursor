@@ -290,15 +290,119 @@ def main_uninstall(args) -> int:
     return 0
 
 
-def _smoke(command: str, cwd: Path) -> tuple[bool, str]:
-    """Run an installed hook command the way Cursor does, and read the answer.
+# Como arranca Cursor 3.21 un hook, leido de su codigo (`executeHookDirect`,
+# `kL` y `zr` en el host de extensiones) y visto en vivo el 2026-09-24. En
+# Windows no es cmd.exe sino PowerShell: el primero de pwsh y powershell que
+# encuentra probando .exe, .bat, .cmd y .ps1 sobre todo el PATH, con el payload
+# en un archivo del temporal de Node que PowerShell manda por un pipe. En el
+# resto, `$SHELL -c` con el payload por stdin. doctor no lo reproduce: correr
+# una shell arrastra todo su arranque (perfiles, rutas de modulos, archivos de
+# inicio), y cada una de esas vias era una forma de que corriera codigo del
+# proyecto. Lo describe, y dice cuando la maquina no dejaria correr ningun hook.
+_TYPOGRAPHIC_QUOTES = "\u2018\u2019\u201a\u201b"
 
-    Through the shell, because hooks.json holds a command line and not an argv.
-    On Windows that shell is cmd.exe, which is what Node uses for a command
-    line: an assumption about Cursor, but the one that fails loudly if the
-    quoting is wrong. The payload carries a BOM because Cursor sends one, and
-    an unknown conversation, so the hook answers without writing any state.
+
+def _system_powershell() -> str:
+    system = os.environ.get("SYSTEMROOT") or r"C:\Windows"
+    return str(Path(system) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
+
+
+def _cursor_shell() -> tuple[str | None, str]:
+    """The shell Cursor would start for a hook on Windows, or what stops it.
+
+    Found the way Cursor's resolver finds it (3.21 and 3.22), without running
+    anything: each extension over the whole PATH before the next one, so a
+    pwsh.exe late on PATH wins over a pwsh.cmd early on it, and anything that
+    exists counts, a directory too, with PATH entries taken as they are. A
+    .bat or .cmd makes Cursor start cmd.exe with PowerShell's arguments, which
+    opens its banner, reads the end of its input and exits 0 having run
+    nothing. A .ps1 makes it start the system's Windows PowerShell. One step
+    stays out of sight: before PATH, Cursor tries each name in its own working
+    directory, which only Cursor knows.
     """
+    entries = os.environ.get("PATH", "").split(os.pathsep)
+    for name in ("pwsh", "powershell"):
+        for extension in (".exe", ".bat", ".cmd", ".ps1"):
+            for entry in entries:
+                candidate = os.path.join(entry, name + extension) if entry else ""
+                if not candidate or not os.path.exists(candidate):
+                    continue
+                # Primero lo que Cursor hace con la extension: cambia un .ps1
+                # por el PowerShell del sistema y un .bat o .cmd por cmd.exe,
+                # y en ninguno de los dos casos corre lo que encontro, sea un
+                # archivo o un directorio.
+                if extension == ".ps1":
+                    system = _system_powershell()
+                    if os.path.isfile(system):
+                        return system, ""
+                    return None, f"{candidate} makes Cursor start {system}, which is not there"
+                if extension in (".bat", ".cmd"):
+                    return None, (
+                        f"{candidate} is a batch file: Cursor would start cmd.exe with PowerShell's "
+                        "arguments, and no hook would run"
+                    )
+                if executables.inside_project(entry) or executables.inside_project(os.path.realpath(candidate)):
+                    return None, f"Cursor would start {candidate}, which is relative to or inside the project"
+                if not os.path.isfile(candidate):
+                    return None, f"Cursor would try to start {candidate}, which is not a file, and no hook would run"
+                return candidate, ""
+    system = _system_powershell()
+    if os.path.isfile(system):
+        return system, ""
+    return None, "no PowerShell found, and Cursor runs every hook through one"
+
+
+def _cursor_tmpdir() -> str:
+    """Where Cursor writes each payload: Node's `os.tmpdir()` on Windows."""
+    path = (
+        os.environ.get("TEMP") or os.environ.get("TMP")
+        or f"{os.environ.get('SystemRoot') or os.environ.get('windir')}\\temp"
+    )
+    if len(path) > 1 and path.endswith("\\") and not path.endswith(":\\"):
+        return path[:-1]
+    return path
+
+
+def _describe_cursor() -> bool:
+    """How Cursor would start the hooks here. False when it would start none."""
+    if sys.platform != "win32":
+        print(f"  cursor:   hooks run through {os.environ.get('SHELL') or '/bin/sh'} -c, payload on stdin")
+        return True
+    shell, problem = _cursor_shell()
+    if shell is None:
+        print(f"  cursor:   NO HOOK WOULD RUN: {problem}")
+        return False
+    print(f"  cursor:   hooks run through {shell}")
+    tmpdir = _cursor_tmpdir()
+    quotes = sorted({ch for ch in tmpdir if ch in _TYPOGRAPHIC_QUOTES})
+    if quotes:
+        print(
+            f"            NO HOOK WOULD RUN: the directory Cursor writes payloads to ({tmpdir}) "
+            f"holds {' '.join(quotes)}, which PowerShell reads as the end of the payload's path"
+        )
+        return False
+    if Path(shell).stem.lower() == "powershell" and not str(Path.cwd()).isascii():
+        print(
+            "            Windows PowerShell re-encodes the payload's non-ASCII characters, and this "
+            "path has some: the hook recovers the edited paths it can. PowerShell 7 (pwsh) on "
+            "PATH delivers them as written."
+        )
+    return True
+
+
+def _smoke(command: str, cwd: Path) -> tuple[bool, str]:
+    """Run an installed hook command once, and read the answer.
+
+    Directly, without a shell: doctor only gets here with the exact command
+    init writes, so its arguments are known, and a shell would add nothing but
+    its own startup. How Cursor starts it is described apart, without running
+    anything (see `_describe_cursor`). The payload carries a BOM because
+    Cursor's does, and an unknown conversation, so the hook answers without
+    writing any state.
+    """
+    argv = templates._tokens(command)
+    if not argv:
+        return False, "the installed command does not split into arguments"
     payload = json.dumps({
         "conversation_id": f"doctor-{uuid.uuid4().hex}",
         "hook_event_name": "afterFileEdit",
@@ -307,7 +411,7 @@ def _smoke(command: str, cwd: Path) -> tuple[bool, str]:
     environment = {**executables.child_environment(), "CURSOR_PROJECT_DIR": str(cwd)}
     try:
         done = subprocess.run(
-            command, shell=True, cwd=str(cwd), input=payload,
+            argv, cwd=str(cwd), input=payload,
             capture_output=True, timeout=20, check=False, env=environment,
         )
     except subprocess.TimeoutExpired:
@@ -397,6 +501,7 @@ def main_doctor(args) -> int:
         print("            and stays inactive. Make it a real directory to enable it.")
 
     cwd = Path.cwd()
+    healthy = _describe_cursor() and healthy
     healthy = _describe_hooks("user", USER_HOOKS, cwd, path) and healthy
     try:
         healthy = _describe_repository(cwd, path) and healthy

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -393,6 +394,177 @@ def test_doctor_never_runs_a_command_it_did_not_write(monkeypatch, tmp_path, cap
     assert "NOT RUN" in salida
     assert str(falso) in salida, "what is not run has to be shown"
     assert not marca.exists(), "doctor executed a command read from a file"
+
+
+def test_the_smoke_run_starts_the_hook_without_a_shell(monkeypatch, tmp_path):
+    """A shell drags in its own startup, profiles, module paths, startup
+    files, and each was a way for code from the project to run: two Codex
+    rounds found five of them. doctor runs the exact command init writes, so
+    it knows its arguments and starts the interpreter directly."""
+    import subprocess
+    import sys
+
+    comando = templates.command_for("afterFileEdit", sys.executable, "", None)
+    visto = {}
+
+    def run(argv, **kwargs):
+        visto.update(argv=argv, **kwargs)
+        return subprocess.CompletedProcess(argv, 0, b"{}\n", b"")
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    assert cli._smoke(comando, tmp_path) == (True, "answered, exit 0")
+    assert visto["argv"] == templates._tokens(comando)
+    assert visto["argv"][0] == sys.executable
+    assert not visto.get("shell")
+    assert visto["input"].startswith(b"\xef\xbb\xbf"), "the payload carries the BOM Cursor's does"
+
+
+def _on_path(monkeypatch, tmp_path, *names):
+    """Directories on PATH, in order, each holding the files named."""
+    entradas = []
+    for index, group in enumerate(names):
+        directory = tmp_path / f"path{index}"
+        directory.mkdir()
+        for name in group:
+            (directory / name).write_bytes(b"")
+        entradas.append(str(directory))
+    monkeypatch.setenv("PATH", os.pathsep.join(entradas))
+    return entradas
+
+
+def test_cursors_shell_is_found_the_way_cursor_finds_it(monkeypatch, tmp_path):
+    """Read from Cursor's `zr`: each extension over the whole PATH before the
+    next one, so a pwsh.exe late on PATH wins over a pwsh.cmd early on it."""
+    temprano, tarde = _on_path(monkeypatch, tmp_path, ["pwsh.cmd"], ["pwsh.exe"])
+    assert cli._cursor_shell() == (os.path.join(tarde, "pwsh.exe"), "")
+
+
+@pytest.mark.parametrize("wrapper", ["pwsh.cmd", "pwsh.bat", "powershell.cmd"])
+def test_a_batch_file_named_like_powershell_means_no_hook_would_run(monkeypatch, tmp_path, wrapper):
+    """Codex, the round on doctor: Cursor starts cmd.exe with PowerShell's
+    arguments. Verified: cmd.exe then opens its banner, reads the end of its
+    input and exits 0 having run nothing, so every hook looks fine and none runs."""
+    _on_path(monkeypatch, tmp_path, [wrapper])
+    shell, problem = cli._cursor_shell()
+    assert shell is None and "batch file" in problem
+
+
+def test_a_directory_named_like_powershell_is_what_cursor_picks(monkeypatch, tmp_path):
+    """Codex, third round on doctor: Cursor's resolver takes anything that
+    exists, a directory too, and then fails to start it."""
+    carpeta = tmp_path / "path0"
+    (carpeta / "pwsh.exe").mkdir(parents=True)
+    monkeypatch.setenv("PATH", str(carpeta))
+    shell, problem = cli._cursor_shell()
+    assert shell is None and "not a file" in problem
+
+
+def test_path_entries_are_taken_as_they_come(monkeypatch, tmp_path):
+    """Cursor does not strip the quotes of a PATH entry, so a quoted one holds
+    nothing it can find."""
+    (entrada,) = _on_path(monkeypatch, tmp_path, ["pwsh.exe"])
+    monkeypatch.setenv("PATH", f'"{entrada}"')
+    monkeypatch.setenv("SYSTEMROOT", str(tmp_path / "sin-sistema"))
+    assert cli._cursor_shell()[0] is None
+
+
+def _system_root(monkeypatch, tmp_path, *, with_powershell=True):
+    root = tmp_path / "sistema"
+    carpeta = root / "System32" / "WindowsPowerShell" / "v1.0"
+    carpeta.mkdir(parents=True)
+    if with_powershell:
+        (carpeta / "powershell.exe").write_bytes(b"")
+    monkeypatch.setenv("SYSTEMROOT", str(root))
+    return str(carpeta / "powershell.exe")
+
+
+def test_a_script_named_pwsh_means_the_systems_windows_powershell(monkeypatch, tmp_path):
+    _on_path(monkeypatch, tmp_path, ["pwsh.ps1"])
+    esperado = _system_root(monkeypatch, tmp_path)
+    assert cli._cursor_shell() == (esperado, "")
+
+
+def test_a_directory_named_pwsh_ps1_still_means_the_systems_windows_powershell(monkeypatch, tmp_path):
+    """Codex, fourth round on doctor: Cursor turns any .ps1 it finds into the
+    system's Windows PowerShell, a directory too, and the hooks run. doctor
+    said none would."""
+    carpeta = tmp_path / "path0"
+    (carpeta / "pwsh.ps1").mkdir(parents=True)
+    monkeypatch.setenv("PATH", str(carpeta))
+    esperado = _system_root(monkeypatch, tmp_path)
+    assert cli._cursor_shell() == (esperado, "")
+
+
+def test_a_script_named_pwsh_without_windows_powershell_runs_nothing(monkeypatch, tmp_path):
+    _on_path(monkeypatch, tmp_path, ["pwsh.ps1"])
+    _system_root(monkeypatch, tmp_path, with_powershell=False)
+    shell, problem = cli._cursor_shell()
+    assert shell is None and "not there" in problem
+
+
+def test_a_shell_cursor_would_take_from_the_project_is_reported(monkeypatch, tmp_path):
+    """Codex, second round on doctor: the adapter searched only the safe part
+    of PATH, so when Cursor's pick came from the project doctor quietly
+    described another shell. Now it names the one Cursor would start."""
+    (entrada,) = _on_path(monkeypatch, tmp_path, ["pwsh.exe"])
+    monkeypatch.setenv("CURSOR_PROJECT_DIR", str(tmp_path))
+    shell, problem = cli._cursor_shell()
+    assert shell is None and "inside the project" in problem
+
+
+@pytest.mark.parametrize("variables, expected", [
+    ({"TEMP": r"C:\t1", "TMP": r"C:\t2"}, r"C:\t1"),
+    ({"TMP": "C:\\t2\\"}, r"C:\t2"),
+    ({"SystemRoot": r"C:\Win"}, r"C:\Win\temp"),
+    ({"TEMP": "C:\\"}, "C:\\"),
+])
+def test_cursors_temporary_directory_is_nodes(monkeypatch, variables, expected):
+    """Codex, second round on doctor: Python and Node pick the temporary
+    directory in different orders (TMPDIR first for Python, TEMP for Node),
+    so doctor judged a directory Cursor does not use. And tempfile writes a
+    probe file to find it; this reads the environment and writes nothing."""
+    for name in ("TEMP", "TMP", "SystemRoot", "windir"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in variables.items():
+        monkeypatch.setenv(name, value)
+    assert cli._cursor_tmpdir() == expected
+
+
+def test_doctor_says_how_cursor_runs_hooks(monkeypatch, capsys):
+    import sys
+
+    assert cli._describe_cursor() is True
+    salida = capsys.readouterr().out
+    assert "cursor:   hooks run through" in salida
+    if sys.platform != "win32":
+        assert "-c, payload on stdin" in salida
+
+
+def test_doctor_fails_where_cursor_would_run_no_hook(monkeypatch, tmp_path, capsys, importable):
+    import sys
+
+    if sys.platform != "win32":
+        pytest.skip("the shell Cursor starts is chosen this way only on Windows")
+    monkeypatch.chdir(tmp_path)
+    run(["init"], monkeypatch, tmp_path)
+    capsys.readouterr()
+    monkeypatch.setattr(cli, "_cursor_shell", lambda: (None, "the reason"))
+    assert run(["doctor"], monkeypatch, tmp_path) == 1
+    assert "NO HOOK WOULD RUN: the reason" in capsys.readouterr().out
+
+
+def test_doctor_names_a_typographic_quote_where_cursor_writes_payloads(monkeypatch, capsys):
+    """Codex, the round on doctor: PowerShell also closes a quoted string at
+    ‘ ’ ‚ ‛, and Cursor escapes only the ASCII quote when it puts the payload's
+    path in its script. With one in that directory no hook gets its payload."""
+    import sys
+
+    if sys.platform != "win32":
+        pytest.skip("the payload goes through a file only on Windows")
+    monkeypatch.setattr(cli, "_cursor_shell", lambda: (r"C:\ps\pwsh.exe", ""))
+    monkeypatch.setenv("TEMP", "C:\\Users\\O\u2019Brien\\AppData\\Local\\Temp")
+    assert cli._describe_cursor() is False
+    assert "NO HOOK WOULD RUN" in capsys.readouterr().out
 
 
 def test_doctor_reports_an_installed_command_that_fails(monkeypatch, tmp_path, capsys, importable):
