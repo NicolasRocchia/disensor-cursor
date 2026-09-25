@@ -32,7 +32,7 @@ except inside repositories whose root holds a `disensor.config.json`.
 | Command | What it does |
 |---|---|
 | `disensor-cursor init` | Installs the hooks in your home. `--project` installs them in the current repository instead. |
-| `disensor-cursor doctor` | Says what is installed, **runs** the installed command once to prove it answers, and flags hooks written by another version. |
+| `disensor-cursor doctor` | Says what is installed, **runs** the installed command once to prove it answers, says how Cursor would start it, and flags hooks written by another version. |
 | `disensor-cursor status` | What the hook decided for each session, and what it could not evaluate and why. |
 | `disensor-cursor uninstall` | Removes only the entries `init` added. `--project` for a repository install, `--purge` to also delete the session state. |
 
@@ -221,9 +221,11 @@ the git that runs. `git` and `disensor` are resolved from `PATH` entries that
 are absolute and outside the project: the folder Cursor names in
 `CURSOR_PROJECT_DIR` or, when it names none, the one the hook found through
 the payload or its working directory, and the repository around that folder,
-found by its `.git` before git ever runs. The disensor `init` found is refused
-inside the project too, although its path is absolute: absolute is not the
-same as outside. And the commands leave the repository they run from out of
+found by its `.git` before git ever runs. A program found there is judged by
+where it really is, too: a link in an entry outside the project that points at
+a program inside it is skipped. The disensor `init` found is refused inside
+the project too, although its path is absolute: absolute is not the same as
+outside. And the commands leave the repository they run from out of
 `PATH` as well, because what `init` resolves there runs in every later
 session; it also refuses a disensor committed to any repository, asking a git
 from outside that repository, and refuses when that git cannot say.
@@ -271,7 +273,9 @@ setting in `GIT_CONFIG_*` or a Python variable that points outside the project
 is trusted. A `PATH` entry that puts somebody else's directory ahead of your
 git already runs their git in your own terminal; the adapter excludes the
 project and the repository around it, which is as far as it can know without
-running git. One case it cannot know: a `core.worktree` in the repository's
+running git. disensor finds its own git on the `PATH` it inherits, which
+leaves those entries out but can still hold a link, in a directory outside
+the project, to a program inside it: that lookup is disensor's. One case it cannot know: a `core.worktree` in the repository's
 own configuration can put the working tree above the folder that holds
 `.git`, and a `PATH` entry between the two is not excluded for the first git
 call. Telling that case apart means parsing git's configuration the way git
@@ -305,6 +309,12 @@ configuration, entering submodules and taking the index lock.
   and a session whose every change went through a shell command, a script or
   `git apply` is never admitted. Once a session is admitted, its terminal edits
   and commits do count.
+- **Two setups keep Cursor from running any hook on Windows, and `doctor`
+  names them.** A `pwsh` or `powershell` on PATH that is a batch file makes
+  Cursor start cmd.exe with PowerShell's arguments, which runs nothing and
+  exits 0. A temporary directory whose path holds a typographic quote (`’`)
+  ends the quoted path of the payload early, because Cursor escapes only the
+  ASCII quote. Both are Cursor's; the adapter cannot route around them.
 - **A hook that stalls holding the lock can cross decisions.** The state lock
   is waited for two seconds at most, because blocking Cursor is worse, and past
   that the waiting hook goes ahead. A hook that stalls longer than that while
@@ -359,14 +369,63 @@ configuration, entering submodules and taking the index lock.
   was disensor's, the check is not evaluated and `status` says why; if it was
   a declaration the adapter reads, that declaration counts as covering
   nothing, which errs toward the notice.
-- **Paths holding `%`, `!`, `$`, a backtick, a double quote or a doubled
-  backslash, or ending in a backslash,** cannot be written into a hook command
-  that every shell and the Windows argument parser read back literally, so
-  `init` refuses them, whether it is the interpreter, disensor, the package
-  directory or a setting it would keep. That includes a Python on a UNC path
-  (`\\server\...`). It says which, and writes nothing.
+- **Paths holding `%`, `!`, `$`, a backtick, a double quote, a typographic
+  double quote or a doubled backslash, or ending in a backslash,** cannot be
+  written into a hook command that every shell and the Windows argument parser
+  read back literally, so `init` refuses them, whether it is the interpreter,
+  disensor, the package directory or a setting it would keep. That includes a
+  Python on a UNC path (`\\server\...`). PowerShell, which runs the hooks on
+  Windows, closes a double-quoted string at `“`, `”` and `„` too; a
+  typographic apostrophe, as in a user folder like `O’Brien`, goes through.
+  It says which, and writes nothing.
 
 ## Verified against a live Cursor
+
+### 0.2.1, as a local plugin, on Cursor 3.21.18 (2026-09-24)
+
+The same code packaged as a Cursor plugin in `~/.cursor/plugins/local`, with
+this machine's interpreter written into its hooks, in a throwaway repository:
+an experiment towards distributing the adapter as a plugin, not a way to
+install it today. The hooks were the ones `init` writes, run from the plugin's
+folder, next to probes that recorded how Cursor ran them.
+
+- **On Windows every hook runs through PowerShell, not cmd.exe.** `pwsh` if it
+  is on PATH, Windows PowerShell otherwise, with `-NoProfile -NonInteractive
+  -ExecutionPolicy Bypass`. The payload is written to a temporary file and
+  piped in by PowerShell with UTF-8 as its output encoding, which is where the
+  BOM comes from. Read from Cursor's code and confirmed by the process chain of
+  a live hook; it holds for every source of hooks, not only plugins. Outside
+  Windows Cursor runs it with `$SHELL -c` and the payload on stdin; that part
+  is read from the code, not run. `doctor` does not reproduce either: running
+  a shell brings its whole startup along (profiles, module paths, startup
+  files), and two review rounds kept finding ways for code from the project
+  to run through it. It runs the installed command directly, as the argv init
+  wrote, and describes which shell Cursor would start and whether any hook
+  would run at all. One step of Cursor's lookup stays out of its sight:
+  before `PATH`, Cursor tries each name in its own working directory.
+- **Windows PowerShell 5.1 re-encodes the payload.** It reads Cursor's file in
+  the ANSI code page, so every non-ASCII character reaches the hook as the
+  ANSI reading of its UTF-8 bytes: `José` arrives as `JosÃ©`. A repository
+  under such a path never matched an edit, and no session there was admitted.
+  The hook now tells from its parent processes whether Cursor started it
+  through Windows PowerShell, and only then undoes it, field by field; a
+  Windows PowerShell started from a terminal may have read its input some
+  other way, and is left alone. A field that cannot be recovered is noted
+  and used as it came. In some code pages, such as the
+  Japanese or Chinese ones, part of it is lost for good. `pwsh` delivers the
+  payload as written. Reproduced by running Cursor's pipe through Windows
+  PowerShell, not in a live run, where every path was ASCII.
+- **PowerShell looks up a bare command name on PATH only**, never in the
+  current directory.
+- **A plugin's hooks run from different directories by event:** the plugin's
+  own folder for `sessionStart` and `afterFileEdit`, the project root for
+  `stop`. `CURSOR_PROJECT_DIR` is set for all of them.
+- **The coverage witness holds.** After a real round and its declaration were
+  committed, `stop` stayed quiet. After a fix to the reviewed code it came back
+  saying the declaration no longer covers the range, with the round command
+  for the new head. The agent asked before each round.
+- **`composer_mode` came as `agent` this time**, where the run below got `chat`
+  for Ask and agent alike. The admission by evidence does not depend on it.
 
 ### 0.2, on Cursor 3.21.18 (2026-09-24)
 
@@ -436,20 +495,18 @@ Windows 11, disensor 0.9.4, a project-level install, agent mode.
 
 ## Still to verify
 
-1. The coverage witness in a live run: a declaration committed after a real
-   round, and the notice staying quiet until a fix makes it stale.
-2. The user-level install end to end. Everything live so far was at project
-   level.
-3. Which shell runs the `command` string on Windows. The quoted form `init`
-   writes runs under it, which is what matters; `doctor` runs it through
-   cmd.exe, the shell Node uses for a command line.
-4. Whether the `env` returned by `sessionStart` reaches later hooks, given that
+1. The user-level install end to end. Everything live so far was at project
+   level, or from a local plugin.
+2. Cursor on macOS and Linux. Its code runs a hook with `$SHELL -c` and the
+   payload on stdin, which is what `doctor` reports there, but no live run
+   has confirmed it.
+3. Whether the `env` returned by `sessionStart` reaches later hooks, given that
    `sessionStart` is documented as fire-and-forget. The adapter does not rely
    on it: the state file is the source of truth.
-5. Whether edits made by subagents reach `afterFileEdit` under the parent's
+4. Whether edits made by subagents reach `afterFileEdit` under the parent's
    conversation. If they do not, their files still count through the baseline,
    once some edit has admitted the session.
-6. Whether `stop` can overtake the `afterFileEdit` of its own turn. If it
+5. Whether `stop` can overtake the `afterFileEdit` of its own turn. If it
    overtook a session's first edit, it would find the session still pending
    and say nothing until the next turn.
 
