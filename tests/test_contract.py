@@ -248,8 +248,13 @@ def test_the_check_never_runs_the_checkouts_git(tmp_path, monkeypatch):
     control = unprotected()
     shutil.copy(whoami, root / "git.exe")
     assert control.returncode == disensor.OK, "the control: the same call answers without the plant"
-    assert sin_proteccion.returncode == disensor.ERROR, "the premise: disensor ran the planted git"
     assert disensor.check_requirement(EXE, root, base, head).verdict == disensor.REQUIRED
+    # disensor 0.11 resuelve git por su cuenta fuera del directorio de trabajo
+    # (su #75), y entonces el plantado no corre ni sin la proteccion del
+    # adaptador. La premisa solo se prueba contra un disensor que todavia lo corre.
+    if sin_proteccion.returncode == disensor.OK:
+        pytest.skip("this disensor no longer runs a git from the working directory: the premise is gone")
+    assert sin_proteccion.returncode == disensor.ERROR, "the premise: disensor ran the planted git"
 
 
 def _plant_pth(root: Path, mark: Path) -> None:
