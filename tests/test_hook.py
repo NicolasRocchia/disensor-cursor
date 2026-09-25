@@ -845,6 +845,161 @@ def test_an_event_without_a_session_id_is_judged_as_before(
 
 # --- robustez -------------------------------------------------------------
 
+def _as_windows_powershell_reads(text: str) -> str:
+    """What Windows PowerShell 5.1 makes of a UTF-8 text in cp1252: each byte
+    read as its cp1252 character, and the five bytes cp1252 leaves undefined
+    as the control characters of the same number, as Windows decodes them."""
+    indefinidos = {0x81, 0x8D, 0x8F, 0x90, 0x9D}
+    return "".join(
+        chr(b) if b in indefinidos else bytes([b]).decode("cp1252") for b in text.encode("utf-8")
+    )
+
+
+def run_raw(hook_event, payload, repo, monkeypatch, capsys):
+    """Like `run`, with the JSON as Cursor's JSON.stringify writes it, non-ASCII
+    left as it is, and the BOM PowerShell adds. `json.dumps` escapes every
+    non-ASCII character, and a payload escaped that way never needs recovering."""
+    import io
+    import sys as system
+
+    crudo = b"\xef\xbb\xbf" + json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    class Fake:
+        buffer = io.BytesIO(crudo)
+
+    monkeypatch.setattr(system, "stdin", Fake())
+    monkeypatch.setenv("CURSOR_PROJECT_DIR", str(repo))
+    assert hook.main(["--event", hook_event]) == 0
+    return emitted(capsys)
+
+
+def test_a_payload_windows_powershell_re_encoded_is_read_as_cursor_wrote_it(
+    repo, monkeypatch, capsys, stdin_payload
+):
+    """Reproduced by running Cursor's pipe through Windows PowerShell 5.1: a
+    path like `Álvaro Ñandú` reaches the hook re-encoded. A repository there
+    never matched its own edits, so no session was admitted and the adapter
+    stayed mute. `Á` is one of the letters whose UTF-8 holds a byte cp1252
+    leaves undefined."""
+    monkeypatch.setattr(hook, "_ansi_codepage", lambda: "cp1252")
+    monkeypatch.setattr(hook, "_launched_by_windows_powershell", lambda: True)
+    acentuado = repo.rename(repo.parent / "Álvaro Ñandú")
+    key = state.session_key("conv-1", str(acentuado))
+    start(acentuado, monkeypatch, capsys, stdin_payload)
+    run_raw("afterFileEdit", {
+        "conversation_id": "conv-1",
+        "session_id": "ses-1",
+        "file_path": _as_windows_powershell_reads(str(acentuado / "src" / "app.py")),
+        "model": "claude-4.5-sonnet",
+    }, acentuado, monkeypatch, capsys)
+    assert state.eligibility(key) == state.ADMITTED
+    assert [r["path"] for r in state.read_edits(key)] == ["src/app.py"]
+
+
+def test_a_payload_pwsh_delivered_is_never_re_decoded(repo, monkeypatch, capsys, stdin_payload):
+    """Codex, second and third rounds on doctor: that a round trip yields
+    valid UTF-8 does not prove the text was wrong. `Â©.txt` goes back as
+    `©.txt`, and guessing from the text, or from which path lands in the
+    repository, attributed edits wrongly. The shell that started the hook
+    decides: pwsh delivers the payload as written."""
+    monkeypatch.setattr(hook, "_ansi_codepage", lambda: "cp1252")
+    monkeypatch.setattr(hook, "_launched_by_windows_powershell", lambda: False)
+    assert hook._undo_ansi_round_trip("Â©.txt") == "©.txt", "the premise: it does round-trip"
+    key = state.session_key("conv-1", str(repo))
+    start(repo, monkeypatch, capsys, stdin_payload)
+    run_raw("afterFileEdit", {
+        "conversation_id": "conv-1",
+        "session_id": "ses-1",
+        "file_path": str(repo / "Â©.txt"),
+        "model": "claude-4.5-sonnet",
+    }, repo, monkeypatch, capsys)
+    assert [r["path"] for r in state.read_edits(key)] == ["Â©.txt"]
+
+
+def test_a_field_that_cannot_be_recovered_does_not_keep_the_path_from_it(monkeypatch):
+    """Codex, second round on doctor: one character that did not go back
+    blocked the whole payload, the edited path with it. Each field is its own,
+    and the ones left as they came are noted."""
+    import io
+    import sys as system
+
+    monkeypatch.setattr(hook, "_ansi_codepage", lambda: "cp1252")
+    monkeypatch.setattr(hook, "_launched_by_windows_powershell", lambda: True)
+    ruta = "C:\\Users\\José\\a.py"
+    llegado = {
+        "conversation_id": "c",
+        "file_path": _as_windows_powershell_reads(ruta),
+        "edits": [{"new_string": "中"}],
+    }
+
+    class Fake:
+        buffer = io.BytesIO(b"\xef\xbb\xbf" + json.dumps(llegado, ensure_ascii=False).encode("utf-8"))
+
+    monkeypatch.setattr(system, "stdin", Fake())
+    data = hook._payload()
+    assert data["file_path"] == ruta
+    assert data["edits"][0]["new_string"] == "中", "kept as it came"
+    assert "could not be recovered" in state.log_path().read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("names, expected", [
+    (["python.exe", "powershell.exe", "Cursor.exe"], True),
+    (["python.exe", "python.exe", "powershell.exe", "Cursor.exe"], True),
+    (["python.exe", "pwsh.exe", "Cursor.exe"], False),
+    # Codex, cuarta ronda: un Windows PowerShell de una terminal pudo leer la
+    # entrada como UTF-8, y reparar un payload correcto lo corrompe.
+    (["python.exe", "powershell.exe", "WindowsTerminal.exe"], False),
+    (["python.exe", "powershell.exe"], False),
+    (["python.exe", "cmd.exe", "powershell.exe", "Cursor.exe"], False),
+    (["python.exe"], False),
+])
+def test_the_shell_that_started_the_hook_is_read_from_its_parents(monkeypatch, names, expected):
+    """Seen live, the chain is python.exe, powershell.exe, Cursor.exe. A
+    virtual environment's python.exe starts the base interpreter as its child,
+    so every Python right above is skipped; then Windows PowerShell has to be
+    next, and Cursor right after it."""
+    monkeypatch.setattr(hook.sys, "platform", "win32")
+    monkeypatch.setattr(hook, "_ancestors", lambda: names)
+    assert hook._launched_by_windows_powershell() is expected
+
+
+def test_the_process_chain_is_walked_up_for_real():
+    """Codex, fourth round: this only checked the first name, so a chain cut
+    at this interpreter passed. A child reads its own chain: itself, and the
+    Python that started it."""
+    import subprocess
+    import sys as system
+
+    if system.platform != "win32":
+        pytest.skip("the snapshot is a Windows call")
+    src = Path(hook.__file__).resolve().parents[1]
+    done = subprocess.run(
+        [system.executable, "-c",
+         f"import sys; sys.path.insert(0, {str(src)!r}); from disensor_cursor import hook; "
+         "print('|'.join(hook._ancestors()))"],
+        capture_output=True, text=True, check=True, timeout=60,
+    )
+    cadena = done.stdout.strip().split("|")
+    assert len(cadena) >= 2, cadena
+    assert all(hook._PYTHON.fullmatch(name) for name in cadena[:2]), cadena
+
+
+def test_the_letters_whose_bytes_cp1252_leaves_undefined_come_back(monkeypatch):
+    """Windows passes 0x81, 0x8D, 0x8F, 0x90 and 0x9D through as control
+    characters, and Python's cp1252 will not encode those back: found by
+    running the pipe. They are taken byte for byte."""
+    monkeypatch.setattr(hook, "_ansi_codepage", lambda: "cp1252")
+    for nombre in ("ÁLVARO", "ÍNDICE", "Ïñigo", "ÐÝ", "José", "mañana €"):
+        assert hook._undo_ansi_round_trip(_as_windows_powershell_reads(nombre)) == nombre
+
+
+def test_outside_windows_nothing_is_re_decoded(monkeypatch):
+    monkeypatch.setattr(hook.sys, "platform", "linux")
+    assert hook._ansi_codepage() is None
+    assert hook._launched_by_windows_powershell() is False
+    assert hook._undo_ansi_round_trip("JosÃ©") == "JosÃ©"
+
+
 def test_a_payload_with_a_byte_order_mark_is_read(repo, monkeypatch, capsys):
     """Cursor sends the payload WITH a BOM on Windows, and json.loads rejects
     it. Found by running it, not by reading the documentation, which does not

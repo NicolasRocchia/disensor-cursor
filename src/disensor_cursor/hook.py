@@ -55,6 +55,144 @@ def _flags(argv: list[str]) -> dict[str, str]:
     return found
 
 
+def _ansi_codepage() -> str | None:
+    """The ANSI code page Windows PowerShell 5.1 reads a file without a BOM in."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        return f"cp{ctypes.windll.kernel32.GetACP()}"
+    except (AttributeError, OSError):
+        return None
+
+
+def _undo_ansi_round_trip(text: str) -> str:
+    """A text as Cursor wrote it, if Windows PowerShell re-encoded it, or as it came.
+
+    Cursor writes the payload as UTF-8 without a BOM and pipes it in with
+    `Get-Content -Raw`, which Windows PowerShell 5.1 reads in the ANSI code
+    page: every non-ASCII character reaches the hook as the ANSI reading of
+    its UTF-8 bytes, an accented e as the two characters its two bytes are in
+    cp1252. Reproduced by running Cursor's pipe through Windows PowerShell;
+    pwsh reads UTF-8 and delivers it as written.
+
+    Going back to the ANSI bytes and reading them as UTF-8 undoes it. The
+    bytes the code page leaves undefined (0x81, 0x8D, 0x8F, 0x90 and 0x9D in
+    cp1252, inside the UTF-8 of U+00C1, U+00CD, U+00CF, U+00D0 and U+00DD)
+    come through Windows as the control characters of the same number, which
+    Python's codec will not encode back, so they are taken byte for byte.
+    Whatever does not make it back is kept as it came. That a round trip
+    yields valid UTF-8 does not prove the text was wrong, so this is applied
+    only to a payload Windows PowerShell delivered (see
+    `_launched_by_windows_powershell`).
+    """
+    codepage = _ansi_codepage()
+    if codepage is None or text.isascii():
+        return text
+    try:
+        original = text.encode(codepage)
+    except LookupError:
+        return text
+    except UnicodeEncodeError:
+        pieces = []
+        for ch in text:
+            try:
+                pieces.append(ch.encode(codepage))
+            except UnicodeEncodeError:
+                if ord(ch) > 0xFF:
+                    return text
+                pieces.append(bytes([ord(ch)]))
+        original = b"".join(pieces)
+    try:
+        return original.decode("utf-8")
+    except UnicodeDecodeError:
+        return text
+
+
+def _ancestors(depth: int = 6) -> list[str]:
+    """The executable names from this process up, from a Toolhelp snapshot."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Entry(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel = ctypes.windll.kernel32
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    snapshot = kernel.CreateToolhelp32Snapshot(0x2, 0)
+    if snapshot in (None, wintypes.HANDLE(-1).value):
+        raise OSError("no process snapshot")
+    table: dict[int, tuple[int, str]] = {}
+    try:
+        entry = Entry()
+        entry.dwSize = ctypes.sizeof(Entry)
+        ok = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            table[entry.th32ProcessID] = (entry.th32ParentProcessID, entry.szExeFile)
+            ok = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel.CloseHandle(snapshot)
+    names, pid = [], os.getpid()
+    for _ in range(depth):
+        if pid not in table:
+            break
+        parent, name = table[pid]
+        names.append(name)
+        pid = parent
+    return names
+
+
+_PYTHON = re.compile(r"(python[0-9.]*|pythonw|py)(\.exe)?", re.IGNORECASE)
+
+
+def _launched_by_windows_powershell() -> bool:
+    """Whether Cursor started this hook through Windows PowerShell 5.1.
+
+    That transport is the one that re-encodes the payload, and pwsh is not,
+    so this is what tells a re-encoded payload from a right one, instead of
+    guessing from the text. Both links count: a Windows PowerShell started
+    from a terminal may have read its input some other way, and repairing a
+    right payload corrupts it. Walked up from this process past any Python in
+    between, since the python.exe of a virtual environment starts the base
+    interpreter as its child. Seen live, the chain is python.exe,
+    powershell.exe, Cursor.exe.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        names = _ancestors()
+    except (OSError, AttributeError, ValueError):
+        return False
+    rest = [name.lower() for name in names[1:]]
+    while rest and _PYTHON.fullmatch(rest[0]):
+        rest.pop(0)
+    return rest[:2] == ["powershell.exe", "cursor.exe"]
+
+
+def _recovered(value, lost: list[str]):
+    """Every string in the payload as Cursor wrote it, one by one, so a field
+    that cannot be recovered does not keep the others from it."""
+    if isinstance(value, str):
+        if value.isascii():
+            return value
+        recovered = _undo_ansi_round_trip(value)
+        if recovered == value:
+            lost.append(value)
+        return recovered
+    if isinstance(value, list):
+        return [_recovered(item, lost) for item in value]
+    if isinstance(value, dict):
+        return {key: _recovered(item, lost) for key, item in value.items()}
+    return value
+
+
 def _payload() -> dict:
     """The event Cursor sent, or an empty one, with the reason recorded.
 
@@ -75,13 +213,25 @@ def _payload() -> dict:
         # y json.loads rechaza el BOM. Se comprobo corriendo de verdad, no
         # leyendo la documentacion, que no lo menciona. Sin BOM se comporta
         # igual que utf-8, asi que cubre las dos formas.
-        data = json.loads(raw.decode("utf-8-sig", "replace"))
+        text = raw.decode("utf-8-sig", "replace")
+        data = json.loads(text)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         state.note(f"payload is not valid JSON ({exc}); {len(raw)} bytes received")
         return {}
     if not isinstance(data, dict):
         state.note(f"payload is a {type(data).__name__}, not an object")
         return {}
+    # Windows PowerShell re-codifica todo caracter no ASCII del payload (ver
+    # `_undo_ansi_round_trip`): un repositorio bajo una ruta con tildes nunca
+    # coincidia con sus propias ediciones y ninguna sesion quedaba admitida.
+    if not text.isascii() and _launched_by_windows_powershell():
+        lost: list[str] = []
+        data = _recovered(data, lost)
+        if lost:
+            state.note(
+                f"{len(lost)} field(s) of a payload re-encoded by Windows PowerShell could not "
+                "be recovered and are used as they came; pwsh delivers them as written"
+            )
     return data
 
 
@@ -169,6 +319,7 @@ def _relative(file_path: str, repo: Path) -> str | None:
         return Path(file_path).resolve().relative_to(repo.resolve()).as_posix()
     except (ValueError, OSError):
         return None
+
 
 
 def _session_start(payload: dict, options: dict) -> tuple[dict, object]:
