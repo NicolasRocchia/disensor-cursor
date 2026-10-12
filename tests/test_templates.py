@@ -35,6 +35,9 @@ BASE_PYTHON = getattr(sys, "_base_executable", None) or sys.executable
     r'"C:\Python314\python.exe" -E -P -m disensor_cursor.hook --event stop --generated-by 0.2.0',
     '"C:\\Python310\\python.exe" -E -c "' + templates._SAFE_ENTRY_310 + '" --event stop '
     "--generated-by 0.2.0",
+    # La de 0.2.x: sin -S, y con el programa que no miraba de donde salia el modulo.
+    '"C:\\Python314\\python.exe" -I -c "' + templates._PROGRAM_022 + '" "C:\\x\\site-packages" '
+    "--event stop --generated-by 0.2.2",
 ])
 def test_what_init_writes_is_recognised_as_ours(command):
     assert templates.is_ours({"command": command})
@@ -52,7 +55,7 @@ def test_what_init_writes_is_recognised_as_ours(command):
     # y init lo borraba, aunque solo imprime.
     "echo -m disensor_cursor.hook --event stop",
     r'"C:\Windows\System32\cmd.exe" -m disensor_cursor.hook --event stop',
-    f'"C:\\herramientas\\otra.exe" -I -c "{templates.PROGRAM}" "x" --event stop',
+    f'"C:\\herramientas\\otra.exe" -I -S -c "{templates.PROGRAM}" "x" --event stop',
 ])
 def test_an_entry_that_only_mentions_the_module_is_somebody_elses(command):
     assert not templates.is_ours({"command": command})
@@ -83,7 +86,7 @@ def test_init_refuses_to_write_anything_but_an_interpreter_first():
     r"C:\Python314\python.exe -m disensor_cursor.hook --event stop",
     r"C:\Python314\python.exe -m disensor_cursor.hook --event inventado --generated-by 0.2.0",
     r"C:\Python314\python.exe -m disensor_cursor.hook --otro valor --event stop --generated-by x",
-    f'"python" -I -c "{templates.PROGRAM}" --event stop --generated-by 0.2.0',
+    f'"python" -I -S -c "{templates.PROGRAM}" --event stop --generated-by 0.2.0',
     templates.command_for("stop", r"C:\Python314\python.exe", "", None)
     + " --config a.json --config b.json",
 ])
@@ -97,7 +100,7 @@ def test_this_hook_with_arguments_nobody_expected_is_still_ours(command):
         templates.hooks_config(r"C:\Python314\python.exe", "", None),
     )
     assert len(merged["hooks"]["stop"]) == 1
-    assert " -I -c " in merged["hooks"]["stop"][0]["command"]
+    assert " -I -S -c " in merged["hooks"]["stop"][0]["command"]
 
 
 _OURS = templates.command_for("stop", r"C:\Python314\python.exe", "", None)
@@ -135,7 +138,7 @@ def test_a_command_that_does_more_than_ours_is_not_ours(command):
 def test_our_program_with_a_broken_directory_is_ours_so_init_replaces_it(location):
     """`""` or `.` there would import the hook from the current directory.
     Not recognised, init would leave that entry installed next to its own."""
-    command = (f'"C:\\Python314\\python.exe" -I -c "{templates.PROGRAM}" "{location}" '
+    command = (f'"C:\\Python314\\python.exe" -I -S -c "{templates.PROGRAM}" "{location}" '
                f"--event stop --generated-by 0.2.0")
     assert templates.is_ours({"command": command})
     merged = templates.merge_hooks(
@@ -215,7 +218,7 @@ def test_a_path_some_shell_would_rewrite_is_refused(path):
 
 def test_the_interpreter_is_isolated_and_told_where_the_package_is():
     command = templates.command_for("stop", sys.executable, "", None)
-    assert f' -I -c "{templates.PROGRAM}" ' in command
+    assert f' -I -S -c "{templates.PROGRAM}" ' in command
     assert f'"{templates.package_location()}"' in command
     assert (Path(templates.package_location()) / "disensor_cursor" / "hook.py").is_file()
 
@@ -338,6 +341,75 @@ def test_the_hook_answers_without_being_pip_installed(tmp_path):
     checkout, _ = _hostile_checkout(tmp_path)
     done = _run(templates.command_for("afterFileEdit", BASE_PYTHON, "", None), checkout,
                 _environment(tmp_path))
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == {}
+
+
+# --- de donde sale el paquete ---------------------------------------------
+
+def _venv_with_decoy(tmp_path: Path) -> tuple[str, Path, Path]:
+    """A virtualenv holding another copy of the package in its site-packages,
+    which leaves one mark when it is imported and another when its hook runs.
+
+    Codex, round on the plugin plan: `-I` keeps site-packages, ahead of the
+    directory the command appends, so an older copy installed there ran
+    instead of the one init found.
+    """
+    import venv
+
+    folder = tmp_path / "entorno"
+    venv.create(folder, with_pip=False)
+    python = str(folder / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
+    done = subprocess.run(
+        [python, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        env=_environment(tmp_path), capture_output=True, text=True, check=True,
+    )
+    package = Path(done.stdout.strip()) / "disensor_cursor"
+    package.mkdir(parents=True)
+    imported, ran = tmp_path / "senuelo-importado.txt", tmp_path / "senuelo-corrido.txt"
+    (package / "__init__.py").write_text(f"open(r'{imported}', 'w').close()\n", encoding="utf-8")
+    (package / "hook.py").write_text(
+        f"def main(*args):\n    open(r'{ran}', 'w').close()\n    print('{{\"decoy\": 1}}')\n    return 0\n",
+        encoding="utf-8",
+    )
+    return python, imported, ran
+
+
+def test_without_S_a_copy_in_site_packages_runs_instead(tmp_path):
+    """The problem is real: the 0.2.x command, `-I` and the program that
+    appended the directory, ran the copy site-packages had."""
+    python, _, ran = _venv_with_decoy(tmp_path)
+    done = subprocess.run(
+        [python, "-I", "-c", templates._PROGRAM_022, templates.package_location(),
+         "--event", "afterFileEdit"],
+        env=_environment(tmp_path), input=b"{}", capture_output=True, timeout=60, check=False,
+    )
+    assert ran.exists(), done.stderr
+    assert json.loads(done.stdout) == {"decoy": 1}
+
+
+def test_the_installed_command_never_imports_a_copy_from_site_packages(tmp_path):
+    python, imported, ran = _venv_with_decoy(tmp_path)
+    done = _run(templates.command_for("afterFileEdit", python, "", None), tmp_path,
+                _environment(tmp_path))
+    assert not imported.exists(), "-S should leave site-packages out"
+    assert not ran.exists()
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == {}
+
+
+def test_the_program_does_not_run_a_package_from_anywhere_else(tmp_path):
+    """The second layer, for a runtime whose `._pth` file puts its own paths
+    first even with -S: the program looks at where the module came from and
+    answers `{}` without running it."""
+    python, imported, ran = _venv_with_decoy(tmp_path)
+    done = subprocess.run(
+        [python, "-I", "-c", templates.PROGRAM, templates.package_location(),
+         "--event", "afterFileEdit"],
+        env=_environment(tmp_path), input=b"{}", capture_output=True, timeout=60, check=False,
+    )
+    assert imported.exists(), "without -S the decoy comes first, as it would with a ._pth"
+    assert not ran.exists()
     assert done.returncode == 0, done.stderr
     assert json.loads(done.stdout) == {}
 

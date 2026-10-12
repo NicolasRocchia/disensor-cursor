@@ -28,8 +28,20 @@ EVENTS = {
 
 # El programa que corre el interprete. Es siempre el mismo texto: la carpeta
 # del paquete llega como primer argumento y no dentro del programa, asi que
-# ninguna ruta tiene que escaparse como literal de Python.
+# ninguna ruta tiene que escaparse como literal de Python. Antes de correr el
+# hook mira de donde salio el modulo: si no es de esa carpeta, contesta `{}` y
+# sale 0 sin ejecutarlo (ver `_entry`).
 PROGRAM = (
+    "import os, sys; sys.path.append(sys.argv[1]); "
+    f"import {MARKER} as h; "
+    "here = os.path.normcase(os.path.realpath(sys.argv[1])); "
+    "sys.exit(h.main(sys.argv[2:]) if os.path.normcase(os.path.dirname(os.path.dirname("
+    "os.path.realpath(h.__file__)))) == here else print({}))"
+)
+
+# El programa de 0.2.x, que se sigue reconociendo para reemplazarlo y
+# desinstalarlo.
+_PROGRAM_022 = (
     "import sys; sys.path.append(sys.argv[1]); "
     f"from {MARKER} import main; sys.exit(main(sys.argv[2:]))"
 )
@@ -109,11 +121,19 @@ def _entry(python: str, location: str) -> list[str]:
     directory init found the package in, absolute, and the program adds
     exactly that directory. Appended and not prepended: in front, a
     site-packages directory would take precedence over the standard library.
+
+    `-S` drops the rest of site-packages too. `-I` alone keeps the system's,
+    ahead of the appended directory, and an older copy installed there ran
+    instead of a newer `--user` install. Without site the package can only
+    come from the directory the command names, save for a runtime whose
+    `._pth` file adds its own paths and even loads site regardless of the
+    flag. That is why the program checks where the module actually came from
+    before running it, and answers `{}` when it is somewhere else.
     """
     interpreter = _quote(python)
     if not is_interpreter(python):
         raise ValueError(f"not a Python interpreter, by its name: {python}")
-    return [interpreter, "-I", "-c", f'"{PROGRAM}"', _quote(location)]
+    return [interpreter, "-I", "-S", "-c", f'"{PROGRAM}"', _quote(location)]
 
 
 def _with_settings(command: str, kept) -> str:
@@ -139,16 +159,18 @@ def command_for(
 
 
 # Como arranca el interprete en cada forma que escribio alguna version: la de
-# hoy, con la carpeta del paquete como argumento (`None` en el patron), las de
-# los borradores de 0.2.0 y la de 0.1.0, sin -E ni -P. Las formas -c exigen el
-# programa EXACTO: con comodines alrededor del import, una entrada ajena que
-# solo imprimia ese texto pasaba por nuestra y uninstall la borraba.
+# hoy, con la carpeta del paquete como argumento (`None` en el patron), la de
+# 0.2.x sin -S, las de los borradores de 0.2.0 y la de 0.1.0, sin -E ni -P.
+# Las formas -c exigen el programa EXACTO: con comodines alrededor del import,
+# una entrada ajena que solo imprimia ese texto pasaba por nuestra y uninstall
+# la borraba.
 _SAFE_ENTRY_310 = (
     "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]; "
     f"from {MARKER} import main; sys.exit(main())"
 )
 _ENTRIES = (
-    ("-I", "-c", PROGRAM, None),
+    ("-I", "-S", "-c", PROGRAM, None),
+    ("-I", "-c", _PROGRAM_022, None),
     ("-E", "-P", "-m", MARKER),
     ("-P", "-m", MARKER),
     ("-E", "-m", MARKER),
