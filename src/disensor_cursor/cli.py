@@ -95,6 +95,27 @@ def _resolve_disensor() -> tuple[str, str]:
     return path, ""
 
 
+def _package_problem() -> str:
+    """Why the package the hooks would import is repository content, or "".
+
+    The command names the directory this package was imported from, and every
+    session in every repository imports it from there. An editable install
+    (`pip install -e`) names a checkout, so every later edit to that
+    checkout, an agent's included, would run inside the hooks. Same doctrine
+    as for disensor: committed to the repository it lives in is refused, an
+    untracked virtualenv inside some checkout is the user's own install.
+    """
+    location = Path(templates.package_location())
+    reason = _repository_content(location / "disensor_cursor" / "hook.py")
+    if not reason:
+        return ""
+    return (
+        f"this disensor-cursor is imported from {location}, and {reason}: every later edit to "
+        "that checkout would run inside the hooks of every session. Install it outside any "
+        "repository (pipx install <path>, or pip install --user <path>, without -e)"
+    )
+
+
 def _write_json(path: Path, data: dict) -> None:
     """Atomic, and patient with Cursor: it may be reading hooks.json right now."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -161,6 +182,13 @@ def _rule_is_ours(text: str) -> bool:
 def main_init(args) -> int:
     report: list[str] = []
     python = _resolve_python()
+    checkout = _package_problem()
+    if checkout and not args.allow_checkout:
+        print(f"init: {checkout}.")
+        print("Re-run with --allow-checkout only if you are developing the adapter and accept that.")
+        return 1
+    if checkout:
+        report.append(f"WARNING {checkout}")
     disensor_path, problem = _resolve_disensor()
     if problem and not args.force:
         print(f"init: {problem}")
@@ -499,6 +527,10 @@ def _describe_hooks(label: str, target: Path, cwd: Path, disensor_path: str) -> 
             ok, detail = _smoke(installed, cwd)
             print(f"            smoke run: {'ok' if ok else 'FAILED'} ({detail})")
             healthy = healthy and ok
+    checkout = _package_problem()
+    if checkout:
+        healthy = False
+        print(f"            WARNING {checkout}")
     return healthy
 
 
@@ -613,6 +645,13 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--force", action="store_true",
         help="Write the hooks even if disensor cannot be found or does not answer.",
+    )
+    init.add_argument(
+        "--allow-checkout", action="store_true",
+        help=(
+            "Install even if this package is imported from a checkout, as with pip install -e. "
+            "For developing the adapter: edits to that checkout will run inside the hooks."
+        ),
     )
     init.set_defaults(func=main_init)
 

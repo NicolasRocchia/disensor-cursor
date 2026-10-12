@@ -3,10 +3,22 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
 from disensor_cursor import cli, templates
+
+
+REAL_PACKAGE_PROBLEM = cli._package_problem
+
+
+@pytest.fixture(autouse=True)
+def installed_outside_a_checkout(monkeypatch):
+    """The suite imports the package from this checkout, which init refuses on
+    purpose (see the tests of `--allow-checkout`). Every other test installs
+    the way a user would."""
+    monkeypatch.setattr(cli, "_package_problem", lambda: "")
 
 
 def run(argv, monkeypatch, tmp_path, *, disensor_ok=True):
@@ -713,3 +725,48 @@ def test_doctor_says_when_the_state_directory_is_a_link(monkeypatch, tmp_path, c
     monkeypatch.chdir(tmp_path)
     assert run(["doctor"], monkeypatch, tmp_path) == 1
     assert "link or junction" in capsys.readouterr().out
+
+
+# --- de donde se importa el paquete ---------------------------------------
+
+def _in_a_git_checkout() -> bool:
+    return (Path(templates.package_location()).parent / ".git").exists()
+
+
+@pytest.mark.skipif(not _in_a_git_checkout(), reason="the suite has to run from a git checkout")
+def test_init_refuses_a_package_imported_from_a_checkout(monkeypatch, tmp_path, capsys):
+    """Codex, round on the plugin plan: after `pip install -e` the hooks import
+    the checkout, and every later edit to it, an agent's included, runs inside
+    them. The suite itself runs from exactly that: this checkout."""
+    monkeypatch.setattr(cli, "_package_problem", REAL_PACKAGE_PROBLEM)
+    assert run(["init"], monkeypatch, tmp_path) == 1
+    salida = capsys.readouterr().out
+    assert "committed to the repository it lives in" in salida
+    assert "--allow-checkout" in salida
+    assert not cli.USER_HOOKS.exists()
+
+
+@pytest.mark.skipif(not _in_a_git_checkout(), reason="the suite has to run from a git checkout")
+def test_allow_checkout_installs_and_says_what_it_costs(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "_package_problem", REAL_PACKAGE_PROBLEM)
+    assert run(["init", "--allow-checkout"], monkeypatch, tmp_path) == 0
+    assert "WARNING this disensor-cursor is imported from" in capsys.readouterr().out
+    assert cli.USER_HOOKS.exists()
+
+
+def test_a_virtualenv_inside_a_checkout_is_the_users_own_install(monkeypatch, repo):
+    """Same doctrine as for disensor: what is refused is committed content."""
+    site = repo / ".venv" / "Lib" / "site-packages"
+    (site / "disensor_cursor").mkdir(parents=True)
+    (site / "disensor_cursor" / "hook.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(templates, "package_location", lambda: str(site))
+    assert REAL_PACKAGE_PROBLEM() == ""
+
+
+def test_doctor_warns_about_hooks_imported_from_a_checkout(monkeypatch, tmp_path, capsys, importable):
+    monkeypatch.chdir(tmp_path)
+    run(["init"], monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "_package_problem", lambda: "this disensor-cursor is imported from X")
+    capsys.readouterr()
+    assert run(["doctor"], monkeypatch, tmp_path) == 1
+    assert "WARNING this disensor-cursor is imported from X" in capsys.readouterr().out
