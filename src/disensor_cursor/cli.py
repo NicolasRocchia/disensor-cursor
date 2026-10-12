@@ -17,6 +17,7 @@ available, and says out loud what it costs.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -30,6 +31,11 @@ from pathlib import Path
 from . import __version__, disensor, executables, gitio, state, templates
 
 USER_HOOKS = Path.home() / ".cursor" / "hooks.json"
+
+# Donde Cursor guarda los plugins: `local/<nombre>` los que el usuario copio,
+# y `cache/<marketplace>/<plugin>/<commit>` los del marketplace.
+CURSOR_PLUGINS = Path.home() / ".cursor" / "plugins"
+PLUGIN_NAME = "disensor-cursor"
 
 _GENERATED_BY = re.compile(r"--generated-by\s+(\S+)")
 
@@ -475,6 +481,94 @@ def _smoke(command: str, cwd: Path) -> tuple[bool, str]:
     return True, "answered, exit 0"
 
 
+# Lo que doctor le pregunta al interprete instalado: de donde importa el
+# modulo que mira `templates.PROGRAM`, `disensor_cursor.hook`, con las mismas
+# banderas que el hook, y que version es el paquete. Mirar el `__init__` no
+# alcanzaba: un `hook.py` resuelto en otra carpeta hacia que el programa
+# contestara `{}` y doctor diera todo por bueno. El programa es de doctor, no
+# del archivo, y corre solo cuando el comando instalado es el que init
+# escribiria hoy. `ascii()` porque con -I la salida va en la pagina de codigos
+# del sistema, y una ruta con otros caracteres no se podia imprimir.
+_PROVENANCE = (
+    "import sys; sys.path.append(sys.argv[1]); import disensor_cursor.hook as h; "
+    "import disensor_cursor as m; print(ascii(h.__file__)); print(ascii(m.__version__))"
+)
+
+
+def _provenance(python: str, location: str, cwd: Path) -> tuple[bool, str]:
+    """Where the installed hook imports this package from, and which version.
+
+    The smoke run cannot tell: a hook that finds the package somewhere else
+    answers `{}` and exits 0 (see `templates.PROGRAM`), the same as one with
+    nothing to say.
+    """
+    try:
+        done = subprocess.run(
+            [python, "-I", "-S", "-c", _PROVENANCE, location], cwd=str(cwd),
+            capture_output=True, timeout=20, check=False, env=executables.child_environment(),
+        )
+    except subprocess.TimeoutExpired:
+        return False, "no answer within 20s"
+    except OSError as exc:
+        return False, f"could not run: {exc}"
+    lines = (done.stdout or b"").decode("ascii", "replace").splitlines()
+    try:
+        loaded, version = (str(ast.literal_eval(line)) for line in lines[:2])
+    except (ValueError, SyntaxError):
+        err = (done.stderr or b"").decode("utf-8", "replace").strip()
+        return False, f"exit {done.returncode}: {err[:200]}"
+    folder = os.path.dirname(os.path.dirname(os.path.realpath(loaded)))
+    if os.path.normcase(folder) != os.path.normcase(os.path.realpath(location)):
+        return False, (
+            f"imported from {folder}, not from {location}: another copy comes first for that "
+            "interpreter, and the hook answers {} there and does nothing"
+        )
+    if version != __version__:
+        return False, f"version {version} there, while doctor runs {__version__}: re-run init"
+    return True, f"{loaded} ({version})"
+
+
+def _plugin_copies() -> list[Path]:
+    """Folders holding this plugin: copied by hand, or from the marketplace."""
+    found = []
+    for pattern in ("local/*/.cursor-plugin/plugin.json", "cache/*/*/*/.cursor-plugin/plugin.json"):
+        for manifest in sorted(CURSOR_PLUGINS.glob(pattern)):
+            try:
+                data = json.loads(manifest.read_bytes().decode("utf-8-sig"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get("name") == PLUGIN_NAME:
+                found.append(manifest.parent.parent)
+    return found
+
+
+def _describe_plugin() -> bool:
+    """Which copies of the plugin are on disk. False when one brings its own hooks.
+
+    Whether Cursor has a copy enabled lives in Cursor's own settings, which
+    doctor does not read, so it says what it found and nothing more. The
+    plugin only carries the setup skill: what runs is what init installed.
+    """
+    copies = _plugin_copies()
+    if not copies:
+        print("  plugin:   not found (the hooks work without it)")
+        return True
+    for folder in copies:
+        print(f"  plugin:   {folder}")
+    print("            whether Cursor has it enabled cannot be read from here. It only brings")
+    print("            the setup skill: what runs is the hooks below.")
+    healthy = True
+    for folder in copies:
+        manifest = _read_json(folder / ".cursor-plugin" / "plugin.json")
+        if (folder / "hooks" / "hooks.json").exists() or manifest.get("hooks"):
+            healthy = False
+            print(
+                f"            {folder} brings hooks of its own: next to the ones init "
+                "installs, every event may run twice"
+            )
+    return healthy
+
+
 def _describe_hooks(label: str, target: Path, cwd: Path, disensor_path: str) -> bool:
     """Print what is installed in one hooks.json. False when something is off.
 
@@ -525,7 +619,10 @@ def _describe_hooks(label: str, target: Path, cwd: Path, disensor_path: str) -> 
             print(f"            init now:  {expected}")
         else:
             ok, detail = _smoke(installed, cwd)
-            print(f"            smoke run: {'ok' if ok else 'FAILED'} ({detail})")
+            print(f"            smoke run: {'ok' if ok else 'FAILED'} ({detail}, without a shell)")
+            healthy = healthy and ok
+            ok, detail = _provenance(_resolve_python(), templates.package_location(), cwd)
+            print(f"            module:    {detail if ok else 'WRONG: ' + detail}")
             healthy = healthy and ok
     checkout = _package_problem()
     if checkout:
@@ -550,6 +647,7 @@ def main_doctor(args) -> int:
 
     cwd = Path.cwd()
     healthy = _describe_cursor() and healthy
+    healthy = _describe_plugin() and healthy
     healthy = _describe_hooks("user", USER_HOOKS, cwd, path) and healthy
     try:
         healthy = _describe_repository(cwd, path) and healthy
@@ -582,6 +680,16 @@ def _describe_repository(cwd: Path, disensor_path: str) -> bool:
     project_hooks = repo / ".cursor" / "hooks.json"
     if project_hooks.exists():
         healthy = _describe_hooks("project", project_hooks, repo, disensor_path) and healthy
+        # Cursor corre en paralelo todas las entradas de un evento, de todas
+        # las fuentes: un evento instalado en las dos corre dos veces aca. Uno
+        # que esta solo en una de ellas no es un duplicado, y avisar por el
+        # mandaba a desinstalar una mitad necesaria.
+        both = sorted(set(_our_entries(_read_json(project_hooks))) & set(_our_entries(_read_json(USER_HOOKS))))
+        if both:
+            healthy = False
+            print(f"  twice:    {', '.join(both)} installed in your home and in this repository: here")
+            print("            they run twice. Keep one: `disensor-cursor uninstall --project`, or")
+            print("            `uninstall`.")
     return healthy
 
 

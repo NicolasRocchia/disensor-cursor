@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ def installed_outside_a_checkout(monkeypatch):
 
 def run(argv, monkeypatch, tmp_path, *, disensor_ok=True):
     monkeypatch.setattr(cli, "USER_HOOKS", tmp_path / "casa" / ".cursor" / "hooks.json")
+    monkeypatch.setattr(cli, "CURSOR_PLUGINS", tmp_path / "casa" / ".cursor" / "plugins")
     monkeypatch.setattr(
         cli, "_resolve_disensor",
         lambda: (str(tmp_path / "bin" / "disensor"), "" if disensor_ok else "no anda"),
@@ -763,6 +765,63 @@ def test_a_virtualenv_inside_a_checkout_is_the_users_own_install(monkeypatch, re
     assert REAL_PACKAGE_PROBLEM() == ""
 
 
+def test_doctor_says_where_the_hook_imports_the_package_from(monkeypatch, tmp_path, capsys, importable):
+    monkeypatch.chdir(tmp_path)
+    run(["init"], monkeypatch, tmp_path)
+    capsys.readouterr()
+    assert run(["doctor"], monkeypatch, tmp_path) == 0
+    esperado = Path(templates.package_location()) / "disensor_cursor" / "hook.py"
+    assert f"module:    {esperado} ({templates.__version__})" in capsys.readouterr().out
+
+
+def test_another_version_where_the_hook_imports_from_is_named(tmp_path):
+    otra = tmp_path / "otra"
+    (otra / "disensor_cursor").mkdir(parents=True)
+    (otra / "disensor_cursor" / "__init__.py").write_text('__version__ = "0.0.1"\n', encoding="utf-8")
+    (otra / "disensor_cursor" / "hook.py").write_text("", encoding="utf-8")
+    ok, detalle = cli._provenance(sys.executable, str(otra), tmp_path)
+    assert not ok
+    assert "version 0.0.1 there" in detalle
+
+
+def test_doctor_looks_at_the_module_the_program_checks(tmp_path):
+    """Codex, round on the 0.3.0 diff: with the package's `__init__` where the
+    command says and its `hook` found somewhere else, the program answers `{}`
+    without running anything, and a doctor that looked at the `__init__` said
+    all was well."""
+    import subprocess
+
+    esperada, otra = tmp_path / "esperada", tmp_path / "otra"
+    (esperada / "disensor_cursor").mkdir(parents=True)
+    (otra / "disensor_cursor").mkdir(parents=True)
+    (esperada / "disensor_cursor" / "__init__.py").write_text(
+        f"__version__ = {templates.__version__!r}\n"
+        f"__path__.append({str(otra / 'disensor_cursor')!r})\n",
+        encoding="utf-8",
+    )
+    corrido = tmp_path / "corrido.txt"
+    (otra / "disensor_cursor" / "hook.py").write_text(
+        f"def main(*args):\n    open({str(corrido)!r}, 'w').close()\n    return 0\n", encoding="utf-8",
+    )
+    hecho = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", templates.PROGRAM, str(esperada), "--event", "stop"],
+        input=b"{}", capture_output=True, timeout=60, check=False,
+    )
+    assert hecho.stdout.decode().strip() == "{}" and not corrido.exists(), "the program refuses it"
+    ok, detalle = cli._provenance(sys.executable, str(esperada), tmp_path)
+    assert not ok
+    assert f"imported from {otra}" in detalle
+
+
+def test_doctor_fails_when_the_module_comes_from_elsewhere(monkeypatch, tmp_path, capsys, importable):
+    monkeypatch.chdir(tmp_path)
+    run(["init"], monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "_provenance", lambda *a: (False, "imported from X, not from Y"))
+    capsys.readouterr()
+    assert run(["doctor"], monkeypatch, tmp_path) == 1
+    assert "module:    WRONG: imported from X, not from Y" in capsys.readouterr().out
+
+
 def test_doctor_warns_about_hooks_imported_from_a_checkout(monkeypatch, tmp_path, capsys, importable):
     monkeypatch.chdir(tmp_path)
     run(["init"], monkeypatch, tmp_path)
@@ -770,3 +829,87 @@ def test_doctor_warns_about_hooks_imported_from_a_checkout(monkeypatch, tmp_path
     capsys.readouterr()
     assert run(["doctor"], monkeypatch, tmp_path) == 1
     assert "WARNING this disensor-cursor is imported from X" in capsys.readouterr().out
+
+
+# --- el plugin ------------------------------------------------------------
+
+def _plugin(folder: Path, name: str = "disensor-cursor", hooks: bool = False) -> Path:
+    (folder / ".cursor-plugin").mkdir(parents=True)
+    (folder / ".cursor-plugin" / "plugin.json").write_text(json.dumps({"name": name}), encoding="utf-8")
+    if hooks:
+        (folder / "hooks").mkdir()
+        (folder / "hooks" / "hooks.json").write_text('{"version": 1, "hooks": {}}', encoding="utf-8")
+    return folder
+
+
+def test_doctor_lists_every_copy_of_the_plugin_it_finds(monkeypatch, tmp_path, capsys):
+    plugins = tmp_path / "plugins"
+    local = _plugin(plugins / "local" / "disensor-cursor")
+    cached = _plugin(plugins / "cache" / "cursor-public" / "disensor-cursor" / "abc123")
+    _plugin(plugins / "local" / "otro", name="otro")
+    monkeypatch.setattr(cli, "CURSOR_PLUGINS", plugins)
+    assert cli._describe_plugin() is True
+    salida = capsys.readouterr().out
+    assert str(local) in salida and str(cached) in salida
+    assert "otro" not in salida
+    assert "cannot be read from here" in salida
+
+
+def test_a_copy_of_the_plugin_with_hooks_of_its_own_is_reported(monkeypatch, tmp_path, capsys):
+    """The plugin only brings the setup skill. A copy with hooks next to
+    init's would run every event twice: Cursor runs all of them in parallel."""
+    plugins = tmp_path / "plugins"
+    _plugin(plugins / "local" / "disensor-cursor", hooks=True)
+    monkeypatch.setattr(cli, "CURSOR_PLUGINS", plugins)
+    assert cli._describe_plugin() is False
+    assert "every event may run twice" in capsys.readouterr().out
+
+
+def test_without_the_plugin_doctor_says_the_hooks_work_anyway(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "CURSOR_PLUGINS", tmp_path / "vacio")
+    assert cli._describe_plugin() is True
+    assert "not found (the hooks work without it)" in capsys.readouterr().out
+
+
+def test_doctor_notices_the_hooks_installed_twice(monkeypatch, tmp_path, capsys, repo, importable):
+    """Cursor runs the entries of every source in parallel: installed in the
+    home and in the repository, each event here runs twice."""
+    monkeypatch.chdir(repo)
+    run(["init"], monkeypatch, tmp_path)
+    run(["init", "--project"], monkeypatch, tmp_path)
+    capsys.readouterr()
+    assert run(["doctor"], monkeypatch, tmp_path) == 1
+    assert "afterFileEdit, sessionStart, stop installed in your home and in this repository" in (
+        capsys.readouterr().out
+    )
+
+
+def _keep_only(path, event):
+    data = read(path)
+    data["hooks"] = {event: data["hooks"][event]}
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_doctor_names_only_the_events_installed_twice(monkeypatch, tmp_path, capsys, repo, importable):
+    monkeypatch.chdir(repo)
+    run(["init"], monkeypatch, tmp_path)
+    run(["init", "--project"], monkeypatch, tmp_path)
+    _keep_only(repo / ".cursor" / "hooks.json", "stop")
+    capsys.readouterr()
+    run(["doctor"], monkeypatch, tmp_path)
+    salida = capsys.readouterr().out
+    assert "  twice:    stop installed in your home" in salida
+
+
+def test_events_split_between_home_and_repository_are_not_twice(monkeypatch, tmp_path, capsys, repo, importable):
+    """Codex, second round on the 0.3.0 diff: with sessionStart in the home and
+    stop in the repository nothing runs twice, and doctor told the user to
+    uninstall half of a working setup."""
+    monkeypatch.chdir(repo)
+    run(["init"], monkeypatch, tmp_path)
+    run(["init", "--project"], monkeypatch, tmp_path)
+    _keep_only(cli.USER_HOOKS, "sessionStart")
+    _keep_only(repo / ".cursor" / "hooks.json", "stop")
+    capsys.readouterr()
+    run(["doctor"], monkeypatch, tmp_path)
+    assert "twice" not in capsys.readouterr().out
