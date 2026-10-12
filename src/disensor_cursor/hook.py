@@ -414,7 +414,9 @@ def _session_start(payload: dict, options: dict) -> tuple[dict, object]:
             "This repository uses disensor. Before the changes of this session merge, they are "
             "attacked by a model from another family and whatever stays open is declared. "
             "`disensor guide` prints the procedure. Running a round sends the material under "
-            "review to an external reviewer, so ask the user before doing it."
+            "review to an external reviewer, so ask the user before doing it. Consent to send "
+            "this repository's material to a cloud reviewer (`disensor reviewer consent`) is "
+            "the user's to give in their own terminal: do not run it yourself."
         )
     }, None
 
@@ -652,7 +654,10 @@ def _required_message(
         ]
         parts += [
             "Running a round sends the material under review to an external reviewer, which is "
-            "the owner's decision and not yours. Ask before running anything.",
+            "the owner's decision and not yours. Ask before running anything. If disensor asks "
+            "for consent to send this repository's material to a cloud reviewer, that consent "
+            "(`disensor reviewer consent`) is the user's to give in their own terminal, even "
+            "after they approve the round: do not run it yourself.",
             "",
             "If the user approves:",
             "",

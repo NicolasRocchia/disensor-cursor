@@ -17,6 +17,7 @@ available, and says out loud what it costs.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -128,18 +129,33 @@ def _our_entries(data: dict) -> dict[str, list[dict]]:
 
 _VERSION_MARK = re.compile(r"^<!-- disensor-cursor v[^>]*-->\s*$", re.MULTILINE)
 
+# El cuerpo de la regla que escribio init de 0.1.0 a 0.2.2, normalizado como
+# en `_rule_is_ours`. 0.3.0 le agrego el consentimiento, y sin esto la regla
+# vieja pasaba por editada: init la conservaba y uninstall la dejaba. Su texto
+# esta en la historia del repositorio y en los tests.
+_PREVIOUS_RULES = frozenset({
+    "e1ce96d45439da5f853c78d4b0ebae252d4b2030ed7075b721b0e0cbacdb4163",
+})
+
 
 def _rule_is_ours(text: str) -> bool:
     """Whether a rule file is exactly what some version of init wrote.
 
     The version marker is ignored so an upgrade can recognise what an older
-    version wrote. Anything else that differs is an edit, and an edit is left
+    version wrote, and so is the body an older version wrote before the text
+    changed. Anything else that differs is an edit, and an edit is left
     alone: same doctrine as disensor's own init, which never overwrites a
     block it cannot recognise as its own.
     """
     def normal(s: str) -> str:
-        return _VERSION_MARK.sub("", s.replace("\r\n", "\n")).strip()
-    return normal(text) == normal(templates.RULE)
+        # Un BOM al principio es un cambio de codificacion, no de contenido:
+        # un editor lo agrega al guardar sin tocar nada.
+        return _VERSION_MARK.sub("", s.replace("\r\n", "\n").lstrip(chr(0xFEFF))).strip()
+    body = normal(text)
+    return (
+        body == normal(templates.RULE)
+        or hashlib.sha256(body.encode("utf-8")).hexdigest() in _PREVIOUS_RULES
+    )
 
 
 def main_init(args) -> int:

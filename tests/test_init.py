@@ -153,6 +153,83 @@ def test_a_rule_from_an_older_version_is_upgraded(monkeypatch, tmp_path, capsys,
     assert regla.read_bytes().decode("utf-8") == templates.RULE
 
 
+# La regla que escribio init de 0.1.0 a 0.2.2, tal cual salio de sus versiones.
+RULE_022 = """---
+alwaysApply: true
+---
+
+# Adversarial review before closing (disensor)
+
+This project uses disensor: before a change merges, it is attacked by a model
+from a different family than the one that wrote it, and whatever the round left
+open is declared as residue.
+
+A hook watches for this. When you finish a turn it may add an automatic notice
+about the state of the round. That notice comes from tooling, not from the
+user: it never authorises you to commit or to run a review on your own.
+
+What you need to know:
+
+- `disensor guide` prints the whole procedure and the filling guide. Read it
+  from there instead of guessing; it travels with the installed version.
+- A diff round reviews commits that already exist, so the tree has to be clean
+  before one can run.
+- `disensor round` sends the material under review to an external reviewer.
+  That is the owner's decision. Ask before running it.
+- Never paste material between models by hand and call it a round.
+- Check every finding against the actual code before accepting it. The reviewer
+  is decorrelated, not right.
+
+<!-- disensor-cursor v0.2.2 -->
+"""
+
+
+def test_the_rule_0_2_2_wrote_is_upgraded(monkeypatch, tmp_path, capsys, repo):
+    """Codex, round on the 0.3.0 diff: the consent line changed the body, and
+    the rule 0.2.2 wrote read as edited, so init kept it as it was."""
+    monkeypatch.chdir(repo)
+    regla = repo / ".cursor" / "rules" / "disensor.mdc"
+    regla.parent.mkdir(parents=True)
+    regla.write_bytes(RULE_022.encode("utf-8"))
+    run(["init", "--project"], monkeypatch, tmp_path)
+    assert regla.read_bytes().decode("utf-8") == templates.RULE
+
+
+def test_the_rule_0_2_2_wrote_is_uninstalled(monkeypatch, tmp_path, capsys, repo):
+    monkeypatch.chdir(repo)
+    regla = repo / ".cursor" / "rules" / "disensor.mdc"
+    regla.parent.mkdir(parents=True)
+    regla.write_bytes(RULE_022.encode("utf-8"))
+    run(["uninstall", "--project"], monkeypatch, tmp_path)
+    assert not regla.exists()
+
+
+@pytest.mark.parametrize("encoding", ["bom", "bom-crlf"])
+def test_a_rule_an_editor_saved_with_a_bom_is_still_ours(monkeypatch, tmp_path, capsys, repo, encoding):
+    """Codex, second round on the 0.3.0 diff: a BOM is an encoding, not an
+    edit, and an editor adds it on saving without touching anything."""
+    monkeypatch.chdir(repo)
+    regla = repo / ".cursor" / "rules" / "disensor.mdc"
+    regla.parent.mkdir(parents=True)
+    texto = RULE_022.replace("\n", "\r\n") if encoding == "bom-crlf" else RULE_022
+    regla.write_bytes(b"\xef\xbb\xbf" + texto.encode("utf-8"))
+    run(["init", "--project"], monkeypatch, tmp_path)
+    assert regla.read_bytes().decode("utf-8") == templates.RULE
+    run(["uninstall", "--project"], monkeypatch, tmp_path)
+    assert not regla.exists()
+
+
+def test_an_edited_rule_of_0_2_2_is_still_left_alone(monkeypatch, tmp_path, capsys, repo):
+    monkeypatch.chdir(repo)
+    regla = repo / ".cursor" / "rules" / "disensor.mdc"
+    regla.parent.mkdir(parents=True)
+    editada = RULE_022.replace("Never paste", "Never, ever paste")
+    regla.write_bytes(editada.encode("utf-8"))
+    run(["init", "--project"], monkeypatch, tmp_path)
+    assert regla.read_bytes().decode("utf-8") == editada
+    assert "edited: left as it is" in capsys.readouterr().out
+
+
 def test_the_rule_is_written_with_the_line_endings_it_was_given(monkeypatch, tmp_path, capsys, repo):
     """write_text would turn every newline into CRLF on Windows, inside
     somebody else's repository."""

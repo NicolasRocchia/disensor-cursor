@@ -341,6 +341,17 @@ def test_it_asks_before_sending_material_to_a_reviewer(
     mensaje = said(stop(repo, monkeypatch, capsys, stdin_payload))
     assert "owner's decision and not yours" in mensaje
     assert "Ask before running anything" in mensaje
+    # Visto en vivo (disensor #84): aprobada la ronda, el agente dio el
+    # consentimiento por su cuenta.
+    assert "`disensor reviewer consent`" in mensaje
+    assert "even after they approve the round: do not run it yourself" in mensaje
+
+
+def test_the_session_context_leaves_consent_to_the_user(repo, monkeypatch, capsys, stdin_payload):
+    contexto = start(repo, monkeypatch, capsys, stdin_payload)["additional_context"]
+    assert "ask the user before doing it" in contexto
+    assert "`disensor reviewer consent`" in contexto
+    assert "do not run it yourself" in contexto
 
 
 def test_a_policy_that_does_not_accept_diff_gets_no_diff_command(

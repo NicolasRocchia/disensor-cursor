@@ -354,6 +354,9 @@ What you need to know:
   before one can run.
 - `disensor round` sends the material under review to an external reviewer.
   That is the owner's decision. Ask before running it.
+- Consent to send this repository's material to a cloud reviewer
+  (`disensor reviewer consent`) is the owner's to give, in their own
+  terminal. Do not run it yourself, even after the user approves a round.
 - Never paste material between models by hand and call it a round.
 - Check every finding against the actual code before accepting it. The reviewer
   is decorrelated, not right.
