@@ -1,0 +1,12 @@
+{
+  "name": "disensor-cursor",
+  "version": "0.2.2",
+  "description": "Walks the agent through installing the disensor-cursor hooks, which remind it to close the adversarial review round with disensor before a change merges. The hooks run no models and handle no API keys.",
+  "author": {
+    "name": "Nicolas Rocchia"
+  },
+  "homepage": "https://github.com/NicolasRocchia/disensor-cursor",
+  "repository": "https://github.com/NicolasRocchia/disensor-cursor",
+  "license": "MIT",
+  "keywords": ["disensor", "adversarial-review", "code-review", "hooks"]
+}
