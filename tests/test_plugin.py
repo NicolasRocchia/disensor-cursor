@@ -44,6 +44,16 @@ def test_the_license_is_there_and_is_the_declared_one():
     assert (ROOT / "LICENSE").read_text(encoding="utf-8").startswith("MIT License")
 
 
+def test_the_logo_is_committed_next_to_the_manifest():
+    """The marketplace checklist wants the logo in the repository, referenced
+    by a relative path, square, and with a background plate."""
+    logo = manifest()["logo"]
+    assert not logo.startswith(("/", "..")) and ":" not in logo
+    text = (ROOT / logo).read_text(encoding="utf-8")
+    assert 'viewBox="0 0 32 32"' in text
+    assert '<rect width="32" height="32"' in text
+
+
 def test_the_plugin_brings_no_hooks_of_its_own():
     """The hooks are the ones init installs, with the absolute interpreter.
     Hooks inside the plugin would have to find Python by name, which two

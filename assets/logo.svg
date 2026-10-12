@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="256" height="256" role="img" aria-label="disensor-cursor">
+  <!--
+    The disensor mark (the frame of a record with the opening declared at
+    the corner, and the residue sitting in it) on a plate: the Cursor
+    marketplace asks for a 1:1 logo with a background.
+  -->
+  <rect width="32" height="32" rx="6" fill="#16181c" />
+  <g fill="none" stroke="#e9e6e0" stroke-width="3.5" stroke-linecap="square">
+    <path d="M7.75 25.5 V6.5 H25.5 V14.5" />
+    <path d="M7.75 25.5 H15" />
+  </g>
+  <rect x="19" y="19" width="6.5" height="6.5" fill="#9a2b1c" />
+</svg>

@@ -8,5 +8,6 @@
   "homepage": "https://github.com/NicolasRocchia/disensor-cursor",
   "repository": "https://github.com/NicolasRocchia/disensor-cursor",
   "license": "MIT",
-  "keywords": ["disensor", "adversarial-review", "code-review", "hooks"]
+  "keywords": ["disensor", "adversarial-review", "code-review", "hooks"],
+  "logo": "assets/logo.svg"
 }
