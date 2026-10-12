@@ -8,9 +8,9 @@ the changes need a review, and reports what it got back. Every decision that
 sends code anywhere stays with the owner.
 
 > **This is a pilot and carries no stability promise.** Flags, messages and
-> behaviour can change between commits. It is not published anywhere, and it
-> is not part of disensor: it consumes disensor's CLI the way any third party
-> would.
+> behaviour can change between commits. It is on no package index or plugin
+> marketplace, and it is not part of disensor: it consumes disensor's CLI the
+> way any third party would.
 
 ## Install
 
